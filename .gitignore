@@ -1,0 +1,4 @@
+daemon.log
+daemon.pid
+config.yml
+__pycache__/

@@ -1,0 +1,15 @@
+# PR Status Dashboard configuration
+# Copy this file to config.yml and edit to your needs:
+#   cp config.yml.example config.yml
+
+# GitHub repos to monitor (full URLs or owner/name shorthand)
+repos:
+  - https://github.com/org/repo1
+  - https://github.com/org/repo2
+  # - org/repo3
+
+# Port to serve the dashboard on (default: 9600)
+# port: 9600
+
+# Data refresh interval in seconds (default: 300)
+# interval: 300
