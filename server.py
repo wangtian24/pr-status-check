@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -156,8 +157,11 @@ def fetch_prs_for_repo(owner, name):
             pr["reviewStates"] = [r.get("state", "") for r in pr.get("reviews", [])]
         return prs
 
-    open_prs = run_gh("open")
-    closed_prs = run_gh("closed")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_open = pool.submit(run_gh, "open")
+        fut_closed = pool.submit(run_gh, "closed")
+        open_prs = fut_open.result()
+        closed_prs = fut_closed.result()
 
     # Fetch unresolved threads + last comment timestamp for open PRs via GraphQL
     open_numbers = [pr["number"] for pr in open_prs]
@@ -402,9 +406,19 @@ def merge_badge(pr):
 
 
 def _approval_sort_key(pr):
-    """0 = approved, 1 = not approved."""
+    """0 = fully approved, 1 = partial approval, 2 = review required, 3 = changes requested, 4 = no reviews."""
     decision = pr.get("reviewDecision") or ""
-    return 0 if decision == "APPROVED" else 1
+    reviews = pr.get("reviewStates", [])
+    approvals = sum(1 for r in reviews if r == "APPROVED")
+
+    if decision == "APPROVED":
+        return 0
+    elif decision == "CHANGES_REQUESTED":
+        return 3
+    elif decision == "REVIEW_REQUIRED":
+        return 1 if approvals > 0 else 2
+    else:
+        return 1 if approvals > 0 else 4
 
 
 def _unresolved_sort_key(pr):
@@ -434,11 +448,12 @@ def _ci_sort_key(pr):
 
 
 def default_sort_prs(prs):
-    """Sort PRs: approved first, then by unresolved count, then by CI status."""
+    """Sort PRs: approved first, then by unresolved count, then by CI status, then oldest first."""
     return sorted(prs, key=lambda p: (
         _approval_sort_key(p),
         _unresolved_sort_key(p),
         _ci_sort_key(p),
+        p.get("createdAt", ""),
     ))
 
 
@@ -491,8 +506,8 @@ def render_table(prs, show_ci=True):
     </table>"""
 
 
-def render_review_table(prs):
-    """Render review PRs grouped by author, oldest first within groups, groups ordered by oldest PR."""
+def render_review_grouped(prs):
+    """Render review PRs grouped by author as sections, oldest first within groups, groups ordered by oldest PR."""
     if not prs:
         return ""
 
@@ -509,10 +524,14 @@ def render_review_table(prs):
     # Order groups by oldest PR in each group
     sorted_groups = sorted(groups.items(), key=lambda g: g[1][0].get("createdAt", ""))
 
-    rows = ""
+    html = ""
     for author, author_prs in sorted_groups:
         author_esc = html_mod.escape(author)
-        for i, pr in enumerate(author_prs):
+        html += f'<h4 class="review-author">@{author_esc} <span class="count">({len(author_prs)})</span></h4>'
+        html += '<div class="review-author-prs">'
+
+        rows = ""
+        for pr in author_prs:
             num = pr["number"]
             title = pr["title"]
             url = pr["url"]
@@ -525,30 +544,29 @@ def render_review_table(prs):
             else:
                 approval_html = '<span class="badge pending">No approvals</span>'
 
-            # Show author only on first row of each group
-            author_cell = f'<td class="author-group" rowspan="{len(author_prs)}">@{author_esc}</td>' if i == 0 else ""
-
-            rows += f"""<tr{"" if i > 0 else ' class="group-start"'}>
+            rows += f"""<tr>
                 <td><a href="{url}" target="_blank">#{num}</a></td>
                 <td><a href="{url}" target="_blank">{html_mod.escape(title)}</a></td>
-                {author_cell}
                 <td class="time-col" data-sort="{created_iso}">{created}</td>
                 <td>{approval_html}</td>
             </tr>"""
 
-    return f"""<table class="sortable">
-        <thead><tr><th>PR</th><th>Title</th><th>Author</th><th>Created</th><th>Status</th></tr></thead>
-        <tbody>{rows}</tbody>
-    </table>"""
+        html += f"""<table class="sortable">
+            <thead><tr><th>PR</th><th>Title</th><th>Created</th><th>Status</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>"""
+        html += '</div>'
+
+    return html
 
 
 def render_review_subsection(prs):
     """Render a per-repo 'Waiting for My Review' subsection."""
     if not prs:
         return ""
-    html = f'<div class="review-subsection">'
+    html = '<div class="review-subsection">'
     html += f'<h3 class="review-sub-header">Waiting for My Review <span class="count">({len(prs)})</span></h3>'
-    html += render_review_table(prs)
+    html += render_review_grouped(prs)
     html += "</div>"
     return html
 
@@ -580,19 +598,48 @@ def render_repo_section(owner, name, active, drafts, recent_closed, review_prs):
     return html
 
 
-def build_body():
-    sections = ""
-    for owner, name in CONFIG["repos"]:
+def _fetch_all_for_repo(owner, name):
+    """Fetch own PRs and review PRs for a repo in parallel."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_own = pool.submit(fetch_prs_for_repo, owner, name)
+        fut_review = pool.submit(fetch_review_prs_for_repo, owner, name)
+
         try:
-            active, drafts, recent_closed = fetch_prs_for_repo(owner, name)
+            active, drafts, recent_closed = fut_own.result()
         except Exception as e:
-            sections += f'<div class="repo-section"><h2>{html_mod.escape(name)}</h2><p class="empty">Error: {e}</p></div>'
-            continue
+            return ("error", owner, name, str(e))
+
         try:
-            review_prs = fetch_review_prs_for_repo(owner, name)
+            review_prs = fut_review.result()
         except Exception:
             review_prs = []
-        sections += render_repo_section(owner, name, active, drafts, recent_closed, review_prs)
+
+    return ("ok", owner, name, active, drafts, recent_closed, review_prs)
+
+
+def build_body():
+    # Fetch all repos in parallel
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(CONFIG["repos"])) as pool:
+        futures = {
+            pool.submit(_fetch_all_for_repo, owner, name): (owner, name)
+            for owner, name in CONFIG["repos"]
+        }
+        for fut in as_completed(futures):
+            owner, name = futures[fut]
+            results[(owner, name)] = fut.result()
+
+    # Render in config order
+    sections = ""
+    for owner, name in CONFIG["repos"]:
+        result = results.get((owner, name))
+        if result is None:
+            continue
+        if result[0] == "error":
+            sections += f'<div class="repo-section"><h2>{html_mod.escape(name)}</h2><p class="empty">Error: {result[3]}</p></div>'
+        else:
+            _, _, _, active, drafts, recent_closed, review_prs = result
+            sections += render_repo_section(owner, name, active, drafts, recent_closed, review_prs)
 
     if not sections:
         sections = '<p class="empty">No PRs found across any repo.</p>'
@@ -671,8 +718,9 @@ def build_full_page(body, fetched_epoch):
                           border-radius: 6px; }}
     .review-sub-header {{ margin-top: 0; font-size: 16px; color: #9a6700;
                           border-bottom: 1px solid #f0dcc8; padding-bottom: 4px; }}
-    .author-group {{ font-weight: 600; vertical-align: top; background: #fdf6ee; }}
-    tr.group-start td {{ border-top: 2px solid #f0dcc8; }}
+    .review-author {{ font-size: 14px; font-weight: 600; color: #57606a; margin: 12px 0 4px 0;
+                      padding-left: 4px; border-bottom: none; }}
+    .review-author-prs {{ margin-left: 16px; }}
 </style>
 </head>
 <body>
