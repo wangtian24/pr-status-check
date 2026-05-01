@@ -37,13 +37,7 @@ echo "GitHub user: @$GH_USER"
 # --- Create config.yml if missing ---
 if [ ! -f "$SCRIPT_DIR/config.yml" ]; then
     cp "$SCRIPT_DIR/config.yml.example" "$SCRIPT_DIR/config.yml"
-    echo ""
-    echo "Created config.yml from config.yml.example."
-    echo "Please edit it to add your repos:"
-    echo "  $EDITOR $SCRIPT_DIR/config.yml"
-    echo ""
-    echo "Then re-run: bash setup.sh"
-    exit 0
+    echo "Created config.yml (workspace: ~/workspace — auto-discovers angellist repos)."
 else
     echo "config.yml found."
 fi

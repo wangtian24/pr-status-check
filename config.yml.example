@@ -2,11 +2,16 @@
 # Copy this file to config.yml and edit to your needs:
 #   cp config.yml.example config.yml
 
-# GitHub repos to monitor (full URLs or owner/name shorthand)
-repos:
-  - https://github.com/org/repo1
-  - https://github.com/org/repo2
-  # - org/repo3
+# Auto-discover all angellist repos from a local workspace directory.
+# Scans each subdirectory for a git remote belonging to the angellist org.
+# If set, explicit 'repos' below are ignored.
+workspace: ~/workspace
+
+# Alternatively, list specific repos to monitor (full URLs or owner/name shorthand).
+# Only used if 'workspace' is not set.
+# repos:
+#   - https://github.com/angellist/repo1
+#   - angellist/repo2
 
 # Port to serve the dashboard on (default: 9600)
 # port: 9600
