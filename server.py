@@ -36,6 +36,7 @@ BOT_AUTHORS = {
 # Populated at startup
 CONFIG = {
     "repos": [],       # list of (owner, name)
+    "workspace": None, # workspace dir to re-scan each refresh (None = fixed repo list)
     "gh_user": "",
     "port": 9600,
     "interval": 300,
@@ -140,8 +141,12 @@ def discover_workspace_repos(workspace_dir):
                 pass
             return None
 
+        # Dedupe by (owner, name): multiple local dirs can track the same repo
+        # (e.g. a clone plus a worktree), which would otherwise render twice.
+        seen = set()
         for parsed in pool.map(check, entries):
-            if parsed:
+            if parsed and parsed not in seen:
+                seen.add(parsed)
                 repos.append(parsed)
 
     return repos
@@ -524,7 +529,16 @@ def render_table(prs, show_ci=True):
         </tr>"""
 
     ci_headers = "<th>CI</th><th>Branch</th>" if show_ci else ""
+    # Fixed column widths so every repo's table aligns identically.
+    if show_ci:
+        colgroup = ('<colgroup><col style="width:5%"><col style="width:31%"><col style="width:9%">'
+                    '<col style="width:10%"><col style="width:15%"><col style="width:12%">'
+                    '<col style="width:10%"><col style="width:8%"></colgroup>')
+    else:
+        colgroup = ('<colgroup><col style="width:6%"><col style="width:45%"><col style="width:11%">'
+                    '<col style="width:12%"><col style="width:14%"><col style="width:12%"></colgroup>')
     return f"""<table class="sortable">
+        {colgroup}
         <thead><tr><th>PR</th><th>Title</th><th>Created</th><th>Last Comment</th><th>Unresolved Comments</th><th>Approval</th>{ci_headers}</tr></thead>
         <tbody>{rows}</tbody>
     </table>"""
@@ -576,6 +590,7 @@ def render_review_grouped(prs):
             </tr>"""
 
         html += f"""<table class="sortable">
+            <colgroup><col style="width:6%"><col style="width:64%"><col style="width:15%"><col style="width:15%"></colgroup>
             <thead><tr><th>PR</th><th>Title</th><th>Created</th><th>Status</th></tr></thead>
             <tbody>{rows}</tbody>
         </table>"""
@@ -692,10 +707,10 @@ def build_full_page(my_prs_html, fetched_epoch):
           border-bottom: 1px solid #e1e4e8; padding-bottom: 4px; }}
     h4 {{ margin-top: 0; }}
     .count {{ color: #666; font-weight: normal; }}
-    table {{ width: 100%; border-collapse: collapse; margin-bottom: 12px; }}
+    table {{ width: 100%; border-collapse: collapse; margin-bottom: 12px; table-layout: fixed; }}
     th {{ text-align: left; padding: 6px 12px; background: #f6f8fa; border-bottom: 2px solid #d0d7de;
           font-size: 12px; color: #57606a; text-transform: uppercase; letter-spacing: 0.5px; }}
-    td {{ padding: 6px 12px; border-bottom: 1px solid #e1e4e8; font-size: 14px; }}
+    td {{ padding: 6px 12px; border-bottom: 1px solid #e1e4e8; font-size: 14px; overflow-wrap: break-word; }}
     tr:hover {{ background: #f6f8fa; }}
     a {{ color: #0969da; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
@@ -894,7 +909,20 @@ def build_full_page(my_prs_html, fetched_epoch):
 # Server
 # ---------------------------------------------------------------------------
 
+def refresh_repos():
+    """Re-scan the workspace in workspace-discovery mode so repos cloned after
+    startup appear without a restart. Keeps the existing list if a scan turns up
+    nothing (e.g. transient git errors or the workspace being temporarily gone)."""
+    workspace_dir = CONFIG.get("workspace")
+    if not workspace_dir:
+        return
+    discovered = discover_workspace_repos(workspace_dir)
+    if discovered:
+        CONFIG["repos"] = discovered
+
+
 def refresh_cache():
+    refresh_repos()
     my_prs_html = build_my_prs_body()
     epoch = int(time.time())
     with _cache_lock:
@@ -993,6 +1021,7 @@ def main():
     workspace_dir = args.workspace or (file_config or {}).get("workspace") or "~/workspace"
     if not CONFIG["repos"]:
         print(f"Scanning {workspace_dir} for angellist repos...")
+        CONFIG["workspace"] = workspace_dir  # re-scanned on every refresh
         CONFIG["repos"] = discover_workspace_repos(workspace_dir)
         if not CONFIG["repos"]:
             print("ERROR: No angellist repos found in workspace and none specified.", file=sys.stderr)
