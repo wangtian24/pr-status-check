@@ -22,6 +22,12 @@ PRs are categorized as:
 - **Drafts** — draft PRs created in the last 30 days
 - **Recently Closed** — PRs closed in the last 7 days
 
+## Tabs
+
+- **My PRs** — your open and draft PRs (loaded automatically, auto-refreshed).
+- **Review Queue** — open PRs from others waiting on your review (loaded on demand).
+- **Recently Merged** — your most recently merged PRs, up to 5 per repo (loaded on demand).
+
 ## Prerequisites
 
 - **Python 3** (no pip packages needed)

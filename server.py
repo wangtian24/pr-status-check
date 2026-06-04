@@ -258,6 +258,25 @@ def fetch_review_prs_for_repo(owner, name):
     return filtered
 
 
+def fetch_merged_prs_for_repo(owner, name):
+    """Fetch the user's most recently merged PRs (up to 5) for a single repo."""
+    repo = f"{owner}/{name}"
+    fields = "number,title,url,createdAt,mergedAt"
+
+    result = subprocess.run(
+        ["gh", "pr", "list", "--repo", repo, "--author", CONFIG["gh_user"],
+         "--state", "merged", "--limit", "5", "--json", fields],
+        capture_output=True, text=True, timeout=30,
+    )
+    if not result.stdout.strip():
+        return []
+
+    prs = json.loads(result.stdout)
+    # Show most-recently-merged first.
+    prs.sort(key=lambda p: p.get("mergedAt", ""), reverse=True)
+    return prs
+
+
 def fetch_pr_graphql_data(owner, name, pr_numbers):
     """Fetch unresolved review thread authors and last comment time via GraphQL."""
     if not pr_numbers:
@@ -531,11 +550,11 @@ def render_table(prs, show_ci=True):
     ci_headers = "<th>CI</th><th>Branch</th>" if show_ci else ""
     # Fixed column widths so every repo's table aligns identically.
     if show_ci:
-        colgroup = ('<colgroup><col style="width:5%"><col style="width:31%"><col style="width:9%">'
+        colgroup = ('<colgroup><col style="width:7%"><col style="width:29%"><col style="width:9%">'
                     '<col style="width:10%"><col style="width:15%"><col style="width:12%">'
                     '<col style="width:10%"><col style="width:8%"></colgroup>')
     else:
-        colgroup = ('<colgroup><col style="width:6%"><col style="width:45%"><col style="width:11%">'
+        colgroup = ('<colgroup><col style="width:7%"><col style="width:44%"><col style="width:11%">'
                     '<col style="width:12%"><col style="width:14%"><col style="width:12%"></colgroup>')
     return f"""<table class="sortable">
         {colgroup}
@@ -590,7 +609,7 @@ def render_review_grouped(prs):
             </tr>"""
 
         html += f"""<table class="sortable">
-            <colgroup><col style="width:6%"><col style="width:64%"><col style="width:15%"><col style="width:15%"></colgroup>
+            <colgroup><col style="width:7%"><col style="width:63%"><col style="width:15%"><col style="width:15%"></colgroup>
             <thead><tr><th>PR</th><th>Title</th><th>Created</th><th>Status</th></tr></thead>
             <tbody>{rows}</tbody>
         </table>"""
@@ -622,6 +641,39 @@ def render_review_repo_section(owner, name, review_prs):
     return html
 
 
+def render_merged_table(prs):
+    if not prs:
+        return ""
+    rows = ""
+    for pr in prs:
+        num = pr["number"]
+        title = pr["title"]
+        url = pr["url"]
+        created_iso = pr.get("createdAt", "")
+        merged_iso = pr.get("mergedAt", "")
+        rows += f"""<tr>
+            <td data-sort="{num}"><a href="{url}" target="_blank">#{num}</a></td>
+            <td data-sort="{html_mod.escape(title)}"><a href="{url}" target="_blank">{html_mod.escape(title)}</a></td>
+            <td class="time-col" data-sort="{created_iso}">{time_ago(created_iso)}</td>
+            <td class="time-col" data-sort="{merged_iso}">{time_ago(merged_iso)}</td>
+        </tr>"""
+
+    return f"""<table class="sortable">
+        <colgroup><col style="width:7%"><col style="width:63%"><col style="width:15%"><col style="width:15%"></colgroup>
+        <thead><tr><th>PR</th><th>Title</th><th>Created</th><th>Merged</th></tr></thead>
+        <tbody>{rows}</tbody>
+    </table>"""
+
+
+def render_merged_repo_section(owner, name, merged_prs):
+    if not merged_prs:
+        return ""
+    html = f'<div class="repo-section"><h2 class="repo-name">{html_mod.escape(name)}</h2>'
+    html += render_merged_table(merged_prs)
+    html += "</div>"
+    return html
+
+
 def _fetch_own_for_repo(owner, name):
     try:
         active, drafts = fetch_prs_for_repo(owner, name)
@@ -634,6 +686,14 @@ def _fetch_review_for_repo(owner, name):
     try:
         review_prs = fetch_review_prs_for_repo(owner, name)
         return ("ok", owner, name, review_prs)
+    except Exception as e:
+        return ("error", owner, name, str(e))
+
+
+def _fetch_merged_for_repo(owner, name):
+    try:
+        merged_prs = fetch_merged_prs_for_repo(owner, name)
+        return ("ok", owner, name, merged_prs)
     except Exception as e:
         return ("error", owner, name, str(e))
 
@@ -688,6 +748,31 @@ def build_review_body():
     return sections or '<p class="empty">No PRs waiting for your review.</p>'
 
 
+def build_merged_body():
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(CONFIG["repos"])) as pool:
+        futures = {
+            pool.submit(_fetch_merged_for_repo, owner, name): (owner, name)
+            for owner, name in CONFIG["repos"]
+        }
+        for fut in as_completed(futures):
+            owner, name = futures[fut]
+            results[(owner, name)] = fut.result()
+
+    sections = ""
+    for owner, name in CONFIG["repos"]:
+        result = results.get((owner, name))
+        if result is None:
+            continue
+        if result[0] == "error":
+            sections += f'<div class="repo-section"><h2>{html_mod.escape(name)}</h2><p class="empty">Error: {result[3]}</p></div>'
+        else:
+            _, _, _, merged_prs = result
+            sections += render_merged_repo_section(owner, name, merged_prs)
+
+    return sections or '<p class="empty">No recently merged PRs found.</p>'
+
+
 def build_full_page(my_prs_html, fetched_epoch):
     gh_user = html_mod.escape(CONFIG["gh_user"])
     return f"""<!DOCTYPE html>
@@ -711,6 +796,7 @@ def build_full_page(my_prs_html, fetched_epoch):
     th {{ text-align: left; padding: 6px 12px; background: #f6f8fa; border-bottom: 2px solid #d0d7de;
           font-size: 12px; color: #57606a; text-transform: uppercase; letter-spacing: 0.5px; }}
     td {{ padding: 6px 12px; border-bottom: 1px solid #e1e4e8; font-size: 14px; overflow-wrap: break-word; }}
+    td:first-child, th:first-child {{ white-space: nowrap; }}
     tr:hover {{ background: #f6f8fa; }}
     a {{ color: #0969da; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
@@ -785,6 +871,7 @@ def build_full_page(my_prs_html, fetched_epoch):
     <div class="tabs">
         <button class="tab-btn active" onclick="switchTab('my-prs', this)">My PRs</button>
         <button class="tab-btn" onclick="switchTab('review', this)">Review Queue</button>
+        <button class="tab-btn" onclick="switchTab('merged', this)">Recently Merged</button>
     </div>
     <div id="my-prs" class="tab-content active">
         {my_prs_html}
@@ -800,6 +887,19 @@ def build_full_page(my_prs_html, fetched_epoch):
                 <span id="review-age" style="color:#888;font-size:13px;"></span>
             </div>
             <div id="review-body"></div>
+        </div>
+    </div>
+    <div id="merged" class="tab-content">
+        <div id="merged-placeholder" class="review-placeholder">
+            <p>Recently merged PRs are not loaded automatically.</p>
+            <button class="load-btn" id="load-merged-btn" onclick="loadMerged()">Load Recently Merged</button>
+        </div>
+        <div id="merged-content" style="display:none">
+            <div class="review-toolbar">
+                <button class="action-btn" onclick="loadMerged()">Refresh</button>
+                <span id="merged-age" style="color:#888;font-size:13px;"></span>
+            </div>
+            <div id="merged-body"></div>
         </div>
     </div>
     <script>
@@ -848,7 +948,7 @@ def build_full_page(my_prs_html, fetched_epoch):
 
         if (loadBtn) loadBtn.classList.add('loading');
         if (loadBtn) loadBtn.textContent = 'Loading...';
-        document.querySelectorAll('.review-toolbar .action-btn').forEach(function(b) {{
+        document.querySelectorAll('#review-content .action-btn').forEach(function(b) {{
             b.classList.add('loading'); b.textContent = 'Refreshing...';
         }});
 
@@ -860,7 +960,7 @@ def build_full_page(my_prs_html, fetched_epoch):
                 body.innerHTML = html;
                 var now = new Date();
                 ageEl.textContent = 'Loaded at ' + now.toLocaleTimeString();
-                document.querySelectorAll('.review-toolbar .action-btn').forEach(function(b) {{
+                document.querySelectorAll('#review-content .action-btn').forEach(function(b) {{
                     b.classList.remove('loading'); b.textContent = 'Refresh';
                 }});
                 initSortable(body);
@@ -869,7 +969,43 @@ def build_full_page(my_prs_html, fetched_epoch):
                 body.innerHTML = '<p class="empty">Failed to load review queue.</p>';
                 content.style.display = 'block';
                 placeholder.style.display = 'none';
-                document.querySelectorAll('.review-toolbar .action-btn').forEach(function(b) {{
+                document.querySelectorAll('#review-content .action-btn').forEach(function(b) {{
+                    b.classList.remove('loading'); b.textContent = 'Retry';
+                }});
+            }});
+    }}
+
+    function loadMerged() {{
+        var loadBtn = document.getElementById('load-merged-btn');
+        var placeholder = document.getElementById('merged-placeholder');
+        var content = document.getElementById('merged-content');
+        var body = document.getElementById('merged-body');
+        var ageEl = document.getElementById('merged-age');
+
+        if (loadBtn) loadBtn.classList.add('loading');
+        if (loadBtn) loadBtn.textContent = 'Loading...';
+        document.querySelectorAll('#merged-content .action-btn').forEach(function(b) {{
+            b.classList.add('loading'); b.textContent = 'Refreshing...';
+        }});
+
+        fetch('/merged-data')
+            .then(function(r) {{ return r.text(); }})
+            .then(function(html) {{
+                placeholder.style.display = 'none';
+                content.style.display = 'block';
+                body.innerHTML = html;
+                var now = new Date();
+                ageEl.textContent = 'Loaded at ' + now.toLocaleTimeString();
+                document.querySelectorAll('#merged-content .action-btn').forEach(function(b) {{
+                    b.classList.remove('loading'); b.textContent = 'Refresh';
+                }});
+                initSortable(body);
+            }})
+            .catch(function() {{
+                body.innerHTML = '<p class="empty">Failed to load recently merged PRs.</p>';
+                content.style.display = 'block';
+                placeholder.style.display = 'none';
+                document.querySelectorAll('#merged-content .action-btn').forEach(function(b) {{
                     b.classList.remove('loading'); b.textContent = 'Retry';
                 }});
             }});
@@ -958,6 +1094,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/review-data":
             html = build_review_body()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+            return
+
+        if self.path == "/merged-data":
+            html = build_merged_body()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
