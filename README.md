@@ -88,19 +88,32 @@ python3 server.py https://github.com/org/repo1 org/repo2
 
 ```bash
 bash setup.sh
-source ~/.bashrc  # or ~/.zshrc
-pr-status-start
+pr-status start
 ```
+
+`setup.sh` installs a single `pr-status` command into `~/.local/bin` (and migrates
+off the older `pr-status-start`/`-stop`/`-restart` aliases if you had them).
 
 | Command | Description |
 |---------|-------------|
-| `pr-status-start` | Start the dashboard in the background |
-| `pr-status-stop` | Stop the daemon |
-| `pr-status-restart` | Restart the daemon |
+| `pr-status start` | Start the dashboard in the background |
+| `pr-status stop` | Stop the daemon |
+| `pr-status restart` | Restart the daemon |
+| `pr-status status` | Show whether it's running (pid + URL) |
+| `pr-status logs` | Tail the daemon log |
+| `pr-status run` | Run in the foreground for debugging (extra args pass through to `server.py`) |
+
+## When the dashboard says "Can't reach GitHub"
+
+The daemon runs `gh` to fetch PRs. A long-running background process can lose access
+to the macOS login keychain where `gh` stores its token; after that, every `gh` call
+fails. The dashboard detects this and shows a red banner instead of a misleading empty
+list — just run `pr-status restart` to fix it.
 
 ## How it works
 
 - Uses `gh pr list` and the GitHub GraphQL API to fetch PR data
 - Auto-detects your GitHub username from `gh auth`
 - Caches results and refreshes in a background thread (default: every 5 min)
+- Checks GitHub CLI auth on each refresh and surfaces failures in the UI
 - Serves a static HTML page with a live "X min ago" timer

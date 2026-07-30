@@ -42,39 +42,35 @@ else
     echo "config.yml found."
 fi
 
-# --- Detect shell rc file ---
-SHELL_NAME="$(basename "$SHELL")"
-if [ "$SHELL_NAME" = "zsh" ]; then
-    RC_FILE="$HOME/.zshrc"
-elif [ "$SHELL_NAME" = "bash" ]; then
-    RC_FILE="$HOME/.bashrc"
-else
-    RC_FILE="$HOME/.bashrc"
-    echo "WARNING: Unknown shell '$SHELL_NAME', defaulting to $RC_FILE"
-fi
-
-# --- Remove old aliases if present, then add new ones ---
+# --- Migrate off the old 3-alias setup, if present ---
 MARKER="# PR Status Dashboard daemon"
-if grep -qF "$MARKER" "$RC_FILE" 2>/dev/null; then
-    sed -i.bak "/$MARKER/,+3d" "$RC_FILE"
-    rm -f "$RC_FILE.bak"
-    echo "Removed old aliases from $RC_FILE"
-fi
+for RC in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    if grep -qF "$MARKER" "$RC" 2>/dev/null; then
+        sed -i.bak "/$MARKER/,+3d" "$RC"
+        rm -f "$RC.bak"
+        echo "Removed old pr-status-* aliases from $RC"
+    fi
+done
 
-cat >> "$RC_FILE" << ALIASES
+# --- Install the unified `pr-status` command on PATH ---
+chmod +x "$SCRIPT_DIR/pr-status"
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+ln -sf "$SCRIPT_DIR/pr-status" "$BIN_DIR/pr-status"
+echo "Linked pr-status -> $BIN_DIR/pr-status"
 
-${MARKER}
-alias pr-status-start='nohup python3 ${SCRIPT_DIR}/server.py > ${SCRIPT_DIR}/daemon.log 2>&1 & echo \$! > ${SCRIPT_DIR}/daemon.pid && echo "PR dashboard started at http://localhost:9600 (pid \$(cat ${SCRIPT_DIR}/daemon.pid))"'
-alias pr-status-stop='if [ -f ${SCRIPT_DIR}/daemon.pid ]; then kill \$(cat ${SCRIPT_DIR}/daemon.pid) 2>/dev/null && rm ${SCRIPT_DIR}/daemon.pid && echo "PR dashboard stopped"; else echo "No daemon running"; fi'
-alias pr-status-restart='pr-status-stop; sleep 1; pr-status-start'
-ALIASES
-
-echo "Added aliases to $RC_FILE"
 echo ""
-echo "Setup complete! To get started:"
-echo "  1. source $RC_FILE"
-echo "  2. pr-status-start"
-echo "  3. Open http://localhost:9600"
+echo "Setup complete!"
+case ":$PATH:" in
+    *":$BIN_DIR:"*)
+        echo "To get started:"
+        echo "  pr-status start"
+        echo "  open http://localhost:9600" ;;
+    *)
+        echo "NOTE: $BIN_DIR is not on your PATH. Add this to your shell rc file:"
+        echo "  export PATH=\"$BIN_DIR:\$PATH\""
+        echo "Then run: pr-status start" ;;
+esac
 echo ""
-echo "Commands: pr-status-start | pr-status-stop | pr-status-restart"
+echo "Commands: pr-status {start|stop|restart|status|logs|run}"
 echo "Config:   $SCRIPT_DIR/config.yml"

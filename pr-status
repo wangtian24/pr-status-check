@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# pr-status — control the PR Status Dashboard daemon.
+#
+#   pr-status start     Start the dashboard in the background
+#   pr-status stop      Stop the dashboard
+#   pr-status restart   Restart it (use this when the page shows a GitHub auth warning)
+#   pr-status status    Show whether it's running
+#   pr-status logs      Tail the daemon log (Ctrl-C to quit)
+#   pr-status run       Run in the foreground for debugging (passes extra args to server.py)
+set -euo pipefail
+
+# Resolve the real directory of this script, following symlinks, so it works
+# whether invoked directly or via a symlink on PATH.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+SERVER="$DIR/server.py"
+PID_FILE="$DIR/daemon.pid"
+LOG_FILE="$DIR/daemon.log"
+
+port() {
+    local p
+    p="$(grep -E '^[[:space:]]*port:' "$DIR/config.yml" 2>/dev/null | head -1 \
+         | sed -E 's/.*port:[[:space:]]*([0-9]+).*/\1/')"
+    echo "${p:-9600}"
+}
+
+is_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    if is_running; then
+        echo "Already running (pid $(cat "$PID_FILE")) at http://localhost:$(port)"
+        return 0
+    fi
+    nohup python3 "$SERVER" > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "Started PR dashboard at http://localhost:$(port) (pid $(cat "$PID_FILE"))"
+}
+
+stop() {
+    if is_running; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        rm -f "$PID_FILE"
+        echo "Stopped."
+    else
+        echo "Not running."
+        rm -f "$PID_FILE"
+    fi
+}
+
+usage() {
+    sed -n '3,9p' "$DIR/pr-status" | sed 's/^#  *//; s/^#//'
+}
+
+case "${1:-help}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)
+        if is_running; then
+            echo "Running (pid $(cat "$PID_FILE")) at http://localhost:$(port)"
+        else
+            echo "Not running."
+        fi ;;
+    logs)    tail -n "${2:-40}" -f "$LOG_FILE" ;;
+    run)     exec python3 "$SERVER" "${@:2}" ;;
+    help|-h|--help) usage ;;
+    *)
+        echo "Unknown command: $1" >&2
+        echo "Usage: pr-status {start|stop|restart|status|logs|run}" >&2
+        exit 1 ;;
+esac
