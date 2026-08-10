@@ -44,7 +44,7 @@ CONFIG = {
 
 # Global cache
 _cache_lock = threading.Lock()
-_cache = {"my_prs_html": "", "fetched_epoch": 0, "gh_error": None}
+_cache = {"my_prs_html": "", "errors": [], "fetched_epoch": 0, "gh_error": None}
 
 # Track last page visit so background refresh pauses when page is closed
 _last_visit_lock = threading.Lock()
@@ -819,6 +819,10 @@ def gh_error_banner(msg):
 
 
 def build_my_prs_body():
+    """Returns (table_html, errors) where errors is a list of (repo_name, message).
+
+    Failed repos are kept out of the main table -- they render in the Errors tab
+    instead of polluting the My PRs view."""
     results = {}
     with ThreadPoolExecutor(max_workers=len(CONFIG["repos"])) as pool:
         futures = {
@@ -830,19 +834,42 @@ def build_my_prs_body():
             results[(owner, name)] = fut.result()
 
     body = ""
+    errors = []
     for owner, name in CONFIG["repos"]:
         result = results.get((owner, name))
         if result is None:
             continue
         if result[0] == "error":
-            body += repo_group_row(name, MY_PR_COLS) + note_row(f"Error: {result[3]}", MY_PR_COLS)
+            errors.append((name, result[3]))
         else:
             _, _, _, active, drafts = result
             if not active and not drafts:
                 continue
             body += repo_group_row(name, MY_PR_COLS) + render_own_prs_rows(active, drafts)
 
-    return wrap_table(MY_PR_HEAD, body, "No open PRs found.")
+    return wrap_table(MY_PR_HEAD, body, "No open PRs found."), errors
+
+
+def errors_footnote(errors):
+    """Compact expandable note for the on-demand tabs, so fetch errors stay out
+    of the main table but remain one click away."""
+    if not errors:
+        return ""
+    names = ", ".join(html_mod.escape(name) for name, _ in errors)
+    return (f'<details class="errors-footnote"><summary>{len(errors)} repos failed to fetch: '
+            f'{names}</summary>{build_errors_body(errors)}</details>')
+
+
+def build_errors_body(errors):
+    if not errors:
+        return '<p class="empty">No fetch errors.</p>'
+    rows = ""
+    for repo, msg in errors:
+        rows += (f'<tr><td class="error-repo">{html_mod.escape(repo)}</td>'
+                 f'<td class="error-msg">{html_mod.escape(msg)}</td></tr>')
+    head = ('<colgroup><col style="width:18%"><col style="width:82%"></colgroup>'
+            '<thead><tr><th>Repo</th><th>Error</th></tr></thead>')
+    return f'<table>{head}<tbody>{rows}</tbody></table>'
 
 
 def build_review_body():
@@ -860,19 +887,20 @@ def build_review_body():
             results[(owner, name)] = fut.result()
 
     body = ""
+    errors = []
     for owner, name in CONFIG["repos"]:
         result = results.get((owner, name))
         if result is None:
             continue
         if result[0] == "error":
-            body += repo_group_row(name, REVIEW_COLS) + note_row(f"Error: {result[3]}", REVIEW_COLS)
+            errors.append((name, result[3]))
         else:
             _, _, _, review_prs = result
             if not review_prs:
                 continue
             body += repo_group_row(name, REVIEW_COLS) + render_review_rows(review_prs)
 
-    return wrap_table(REVIEW_HEAD, body, "No PRs waiting for your review.")
+    return wrap_table(REVIEW_HEAD, body, "No PRs waiting for your review.") + errors_footnote(errors)
 
 
 def build_merged_body():
@@ -890,26 +918,33 @@ def build_merged_body():
             results[(owner, name)] = fut.result()
 
     body = ""
+    errors = []
     for owner, name in CONFIG["repos"]:
         result = results.get((owner, name))
         if result is None:
             continue
         if result[0] == "error":
-            body += repo_group_row(name, MERGED_COLS) + note_row(f"Error: {result[3]}", MERGED_COLS)
+            errors.append((name, result[3]))
         else:
             _, _, _, merged_prs = result
             if not merged_prs:
                 continue
             body += repo_group_row(name, MERGED_COLS) + render_merged_rows(merged_prs)
 
-    return wrap_table(MERGED_HEAD, body, "No recently merged PRs found.")
+    return wrap_table(MERGED_HEAD, body, "No recently merged PRs found.") + errors_footnote(errors)
 
 
-def build_full_page(my_prs_html, fetched_epoch, gh_error=None):
+def build_full_page(my_prs_html, fetched_epoch, gh_error=None, errors=None):
     gh_user = html_mod.escape(CONFIG["gh_user"])
     banner_html = gh_error_banner(gh_error) if gh_error else ""
     if gh_error:
         my_prs_html = '<p class="empty">PR data unavailable — see the warning above.</p>'
+    errors = errors or []
+    errors_tab_btn = ""
+    if errors:
+        errors_tab_btn = (f'<button class="tab-btn errors-tab" onclick="switchTab(\'errors\', this)">'
+                          f'Errors ({len(errors)})</button>')
+    errors_html = build_errors_body(errors)
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -976,6 +1011,13 @@ def build_full_page(my_prs_html, fetched_epoch, gh_error=None):
     .tab-btn.active {{ color: #0969da; border-bottom-color: #0969da; }}
     .tab-content {{ display: none; }}
     .tab-content.active {{ display: block; }}
+    .errors-tab {{ margin-left: auto; color: #cf222e; }}
+    .errors-tab:hover, .errors-tab.active {{ color: #cf222e; border-bottom-color: #cf222e; }}
+    .error-repo {{ font-weight: 600; white-space: nowrap; }}
+    .error-msg {{ color: #57606a; font-style: italic; font-size: 13px;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .errors-footnote {{ margin: 8px 0 16px; font-size: 13px; color: #888; }}
+    .errors-footnote summary {{ cursor: pointer; }}
     /* Reload / action buttons */
     .action-btn {{ background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
                    padding: 2px 10px; font-size: 13px; cursor: pointer; color: #0969da;
@@ -1017,6 +1059,7 @@ def build_full_page(my_prs_html, fetched_epoch, gh_error=None):
         <button class="tab-btn active" onclick="switchTab('my-prs', this)">My PRs</button>
         <button class="tab-btn" onclick="switchTab('review', this)">Review Queue</button>
         <button class="tab-btn" onclick="switchTab('merged', this)">Recently Merged</button>
+        {errors_tab_btn}
     </div>
     <div id="my-prs" class="tab-content active">
         {my_prs_html}
@@ -1046,6 +1089,9 @@ def build_full_page(my_prs_html, fetched_epoch, gh_error=None):
             </div>
             <div id="merged-body"></div>
         </div>
+    </div>
+    <div id="errors" class="tab-content">
+        {errors_html}
     </div>
     <script>
     (function() {{
@@ -1228,10 +1274,11 @@ def refresh_repos():
 def refresh_cache():
     refresh_repos()
     error = gh_health()
-    my_prs_html = "" if error else build_my_prs_body()
+    my_prs_html, errors = ("", []) if error else build_my_prs_body()
     epoch = int(time.time())
     with _cache_lock:
         _cache["my_prs_html"] = my_prs_html
+        _cache["errors"] = errors
         _cache["fetched_epoch"] = epoch
         _cache["gh_error"] = error
 
@@ -1284,12 +1331,13 @@ class Handler(BaseHTTPRequestHandler):
 
         with _cache_lock:
             my_prs_html = _cache["my_prs_html"]
+            errors = _cache["errors"]
             epoch = _cache["fetched_epoch"]
             gh_error = _cache["gh_error"]
         if epoch == 0:
             page = "<html><body><h1>Loading...</h1><p>First refresh in progress, reload in a few seconds.</p></body></html>"
         else:
-            page = build_full_page(my_prs_html, epoch, gh_error)
+            page = build_full_page(my_prs_html, epoch, gh_error, errors)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
