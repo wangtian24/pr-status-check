@@ -112,7 +112,7 @@ list — just run `pr-status restart` to fix it.
 
 ## How it works
 
-- Uses `gh pr list` and the GitHub GraphQL API to fetch PR data
+- Uses one GitHub GraphQL `search` query per tab (not one call per repo), so a large workspace stays well inside the 5,000-points-per-hour GraphQL budget
 - Auto-detects your GitHub username from `gh auth`
 - Caches results and refreshes in a background thread (default: every 5 min)
 - Checks GitHub CLI auth on each refresh and surfaces failures in the UI

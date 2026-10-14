@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -285,190 +285,132 @@ def annotate_harness(prs):
 # Data fetching
 # ---------------------------------------------------------------------------
 
-def fetch_prs_for_repo(owner, name):
-    """Fetch open (non-closed) PRs authored by the user for a single repo."""
-    repo = f"{owner}/{name}"
-    now = datetime.now(timezone.utc)
-    thirty_days_ago = now - timedelta(days=30)
+def gh_search_prs(query, fields, page_size=50, max_results=1000):
+    """Run a GraphQL PR search across all repos, following pages.
 
-    fields = "number,title,body,isDraft,createdAt,updatedAt,reviewDecision,url,reviews,statusCheckRollup,mergeable,mergeStateStatus"
-
-    result = subprocess.run(
-        ["gh", "pr", "list", "--repo", repo, "--author", CONFIG["gh_user"],
-         "--state", "open", "--limit", "100", "--json", fields],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        lines = (result.stderr or "").strip().splitlines()
-        raise RuntimeError(lines[0] if lines else "gh pr list failed")
-    open_prs = annotate_harness(json.loads(result.stdout) if result.stdout.strip() else [])
-    for pr in open_prs:
-        pr["reviewStates"] = [r.get("state", "") for r in pr.get("reviews", [])]
-
-    open_numbers = [pr["number"] for pr in open_prs]
-    graphql_data = fetch_pr_graphql_data(owner, name, open_numbers)
-    for pr in open_prs:
-        gql = graphql_data.get(pr["number"], {})
-        pr["unresolvedThreads"] = gql.get("unresolved", [])
-        pr["lastCommentAt"] = gql.get("lastCommentAt", "")
-
-    active, drafts = [], []
-    for pr in open_prs:
-        if pr.get("isDraft"):
-            created = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
-            if created >= thirty_days_ago:
-                drafts.append(pr)
-        else:
-            active.append(pr)
-
-    return active, drafts
+    One search replaces a per-repo `gh pr list` loop: GitHub bills GraphQL by
+    requested nodes, so per-repo loops over a large workspace exhaust the hourly budget."""
+    nodes, cursor = [], None
+    while True:
+        after = f", after: {json.dumps(cursor)}" if cursor else ""
+        q = (f"{{ search(query: {json.dumps(query)}, type: ISSUE, first: {page_size}{after}) {{ "
+             f"pageInfo {{ hasNextPage endCursor }} "
+             f"nodes {{ ... on PullRequest {{ repository {{ nameWithOwner }} {fields} }} }} }} }}")
+        proc = subprocess.run(["gh", "api", "graphql", "-f", f"query={q}"],
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            lines = (proc.stderr or "").strip().splitlines()
+            raise RuntimeError(lines[0] if lines else "gh api graphql failed")
+        search = json.loads(proc.stdout)["data"]["search"]
+        nodes += [n for n in search["nodes"] if n]
+        if not search["pageInfo"]["hasNextPage"] or len(nodes) >= max_results:
+            return nodes
+        cursor = search["pageInfo"]["endCursor"]
 
 
-def fetch_review_prs_for_repo(owner, name):
-    """Fetch open PRs waiting for the user's review (not authored by user, not draft, not approved)."""
-    repo = f"{owner}/{name}"
-    gh_user = CONFIG["gh_user"]
-    now = datetime.now(timezone.utc)
-    two_days_ago = now - timedelta(days=2)
-
-    fields = "number,title,body,state,isDraft,createdAt,updatedAt,reviewDecision,url,reviews,author"
-    search_query = f"is:open -review:approved -is:draft -author:{gh_user}"
-
-    result = subprocess.run(
-        ["gh", "pr", "list", "--repo", repo,
-         "--search", search_query, "--limit", "50",
-         "--json", fields],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        lines = (result.stderr or "").strip().splitlines()
-        raise RuntimeError(lines[0] if lines else "gh pr list failed")
-    if not result.stdout.strip():
-        return []
-
-    prs = annotate_harness(json.loads(result.stdout))
-
-    # Filter to past 2 days and enrich with review info
-    filtered = []
+def group_by_repo(prs):
+    """{(owner, name): [prs]} for configured repos only."""
+    wanted = {f"{o}/{n}": (o, n) for o, n in CONFIG["repos"]}
+    grouped = {}
     for pr in prs:
-        created = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
-        if created < two_days_ago:
-            continue
-        reviews = pr.get("reviews", [])
+        key = wanted.get(pr["repository"]["nameWithOwner"])
+        if key:
+            grouped.setdefault(key, []).append(pr)
+    return grouped
+
+
+def owner_qualifiers():
+    return " ".join(sorted({f"user:{o}" for o, _ in CONFIG["repos"]}))
+
+
+def _nodes(obj, *path):
+    for p in path:
+        obj = (obj or {}).get(p)
+    return (obj or {}).get("nodes") or []
+
+
+def _normalize_check(c):
+    if "context" in c:  # legacy commit status: has state, not status/conclusion
+        state = c.get("state", "")
+        done = state not in ("PENDING", "EXPECTED")
+        return {"name": c["context"], "status": "COMPLETED" if done else "IN_PROGRESS",
+                "conclusion": state if done else ""}
+    return c
+
+
+OWN_PR_FIELDS = """
+    number title body isDraft createdAt url reviewDecision mergeable mergeStateStatus
+    reviews(last: 50) { nodes { state createdAt } }
+    comments(last: 1) { nodes { createdAt } }
+    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 50) { nodes {
+        ... on CheckRun { name status conclusion }
+        ... on StatusContext { context state } } } } } } }
+    reviewThreads(first: 50) { nodes { isResolved comments(first: 1) { nodes { author { login } } } } }
+    latestThread: reviewThreads(last: 1) { nodes { comments(last: 1) { nodes { createdAt } } } }
+"""
+
+
+def fetch_own_prs():
+    """{(owner, name): (active, drafts)} for the user's open PRs."""
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    prs = annotate_harness(gh_search_prs(
+        f"is:pr is:open archived:false author:{CONFIG['gh_user']} {owner_qualifiers()}", OWN_PR_FIELDS, page_size=25))
+    for pr in prs:
+        reviews = _nodes(pr, "reviews")
         pr["reviewStates"] = [r.get("state", "") for r in reviews]
-        # Count approvals from others
-        approvals = sum(1 for r in reviews if r.get("state") == "APPROVED")
-        pr["otherApprovals"] = approvals
-        pr["authorLogin"] = pr.get("author", {}).get("login", "")
-        filtered.append(pr)
-
-    return filtered
-
-
-def fetch_merged_prs_for_repo(owner, name):
-    """Fetch the user's most recently merged PRs (up to 5) for a single repo."""
-    repo = f"{owner}/{name}"
-    fields = "number,title,body,url,createdAt,mergedAt"
-
-    result = subprocess.run(
-        ["gh", "pr", "list", "--repo", repo, "--author", CONFIG["gh_user"],
-         "--state", "merged", "--limit", "5", "--json", fields],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        lines = (result.stderr or "").strip().splitlines()
-        raise RuntimeError(lines[0] if lines else "gh pr list failed")
-    if not result.stdout.strip():
-        return []
-
-    prs = annotate_harness(json.loads(result.stdout))
-    # Show most-recently-merged first.
-    prs.sort(key=lambda p: p.get("mergedAt", ""), reverse=True)
-    return prs
-
-
-def fetch_pr_graphql_data(owner, name, pr_numbers):
-    """Fetch unresolved review thread authors and last comment time via GraphQL."""
-    if not pr_numbers:
-        return {}
+        commits = _nodes(pr, "commits")
+        rollup = (commits[0]["commit"].get("statusCheckRollup") if commits else None) or {}
+        pr["statusCheckRollup"] = [_normalize_check(c) for c in _nodes(rollup, "contexts") if c]
+        pr["unresolvedThreads"] = [
+            ((_nodes(t, "comments") or [{}])[0].get("author") or {}).get("login", "unknown")
+            for t in _nodes(pr, "reviewThreads")
+            if not t.get("isResolved") and _nodes(t, "comments")
+        ]
+        timestamps = [c.get("createdAt") for c in _nodes(pr, "comments")]
+        timestamps += [r.get("createdAt") for r in reviews[-1:]]
+        for t in _nodes(pr, "latestThread"):
+            timestamps += [c.get("createdAt") for c in _nodes(t, "comments")]
+        pr["lastCommentAt"] = max((t for t in timestamps if t), default="")
 
     result = {}
-    for i in range(0, len(pr_numbers), 10):
-        batch = pr_numbers[i:i + 10]
-        fragments = []
-        for idx, num in enumerate(batch):
-            fragments.append(f"""
-                pr{idx}: pullRequest(number: {num}) {{
-                    number
-                    comments(last: 1) {{
-                        nodes {{ createdAt }}
-                    }}
-                    reviews(last: 1) {{
-                        nodes {{ createdAt }}
-                    }}
-                    reviewThreads(first: 100) {{
-                        nodes {{
-                            isResolved
-                            comments(first: 1) {{
-                                nodes {{
-                                    author {{ login }}
-                                }}
-                            }}
-                        }}
-                    }}
-                    latestComment: reviewThreads(last: 1) {{
-                        nodes {{
-                            comments(last: 1) {{
-                                nodes {{ createdAt }}
-                            }}
-                        }}
-                    }}
-                }}
-            """)
-
-        query = f"""{{ repository(owner: "{owner}", name: "{name}") {{ {"".join(fragments)} }} }}"""
-
-        try:
-            proc = subprocess.run(
-                ["gh", "api", "graphql", "-f", f"query={query}"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if proc.returncode != 0:
-                continue
-            data = json.loads(proc.stdout)
-            repo_data = data.get("data", {}).get("repository", {})
-
-            for idx in range(len(batch)):
-                pr_data = repo_data.get(f"pr{idx}", {})
-                num = pr_data.get("number", batch[idx])
-
-                threads = pr_data.get("reviewThreads", {}).get("nodes", [])
-                unresolved = []
-                for t in threads:
-                    if not t.get("isResolved"):
-                        comments = t.get("comments", {}).get("nodes", [])
-                        if comments:
-                            author = comments[0].get("author", {}).get("login", "unknown")
-                            unresolved.append(author)
-
-                timestamps = []
-                for c in pr_data.get("comments", {}).get("nodes", []):
-                    if c.get("createdAt"):
-                        timestamps.append(c["createdAt"])
-                for r in pr_data.get("reviews", {}).get("nodes", []):
-                    if r.get("createdAt"):
-                        timestamps.append(r["createdAt"])
-                for t in pr_data.get("latestComment", {}).get("nodes", []):
-                    for c in t.get("comments", {}).get("nodes", []):
-                        if c.get("createdAt"):
-                            timestamps.append(c["createdAt"])
-
-                last_comment = max(timestamps) if timestamps else ""
-                result[num] = {"unresolved": unresolved, "lastCommentAt": last_comment}
-        except Exception:
-            continue
-
+    for repo, repo_prs in group_by_repo(prs).items():
+        active, drafts = [], []
+        for pr in repo_prs:
+            if not pr.get("isDraft"):
+                active.append(pr)
+            elif datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00")) >= thirty_days_ago:
+                drafts.append(pr)
+        result[repo] = (active, drafts)
     return result
+
+
+def fetch_review_prs():
+    """{(owner, name): [prs]} of open PRs from the past 2 days waiting for review
+    (not authored by user, not draft, not approved)."""
+    gh_user = CONFIG["gh_user"]
+    since = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    query = (f"is:pr is:open -review:approved -is:draft -author:{gh_user} "
+             f"created:>={since} {owner_qualifiers()}")
+    fields = "number title body createdAt url author { login } reviews(last: 30) { nodes { state } }"
+    prs = annotate_harness(gh_search_prs(query, fields))
+    for pr in prs:
+        pr["reviewStates"] = [r.get("state", "") for r in _nodes(pr, "reviews")]
+        pr["otherApprovals"] = pr["reviewStates"].count("APPROVED")
+        pr["authorLogin"] = (pr.get("author") or {}).get("login", "")
+    return group_by_repo(prs)
+
+
+def fetch_merged_prs():
+    """{(owner, name): [prs]} of the user's 5 most recently merged PRs per repo."""
+    # ponytail: only the 100 most recently updated merged PRs are scanned; a repo
+    # whose last merge is older drops off. Raise max_results if that matters.
+    prs = annotate_harness(gh_search_prs(
+        f"is:pr is:merged author:{CONFIG['gh_user']} sort:updated-desc {owner_qualifiers()}",
+        "number title body url createdAt mergedAt", max_results=100))
+    grouped = group_by_repo(prs)
+    for repo in grouped:
+        grouped[repo] = sorted(grouped[repo], key=lambda p: p.get("mergedAt", ""), reverse=True)[:5]
+    return grouped
 
 
 # ---------------------------------------------------------------------------
@@ -781,30 +723,6 @@ def render_merged_rows(prs):
     return rows
 
 
-def _fetch_own_for_repo(owner, name):
-    try:
-        active, drafts = fetch_prs_for_repo(owner, name)
-        return ("ok", owner, name, active, drafts)
-    except Exception as e:
-        return ("error", owner, name, str(e))
-
-
-def _fetch_review_for_repo(owner, name):
-    try:
-        review_prs = fetch_review_prs_for_repo(owner, name)
-        return ("ok", owner, name, review_prs)
-    except Exception as e:
-        return ("error", owner, name, str(e))
-
-
-def _fetch_merged_for_repo(owner, name):
-    try:
-        merged_prs = fetch_merged_prs_for_repo(owner, name)
-        return ("ok", owner, name, merged_prs)
-    except Exception as e:
-        return ("error", owner, name, str(e))
-
-
 def gh_error_banner(msg):
     """Prominent red banner shown when the GitHub CLI can't authenticate."""
     return (
@@ -819,35 +737,15 @@ def gh_error_banner(msg):
 
 
 def build_my_prs_body():
-    """Returns (table_html, errors) where errors is a list of (repo_name, message).
-
-    Failed repos are kept out of the main table -- they render in the Errors tab
-    instead of polluting the My PRs view."""
-    results = {}
-    with ThreadPoolExecutor(max_workers=len(CONFIG["repos"])) as pool:
-        futures = {
-            pool.submit(_fetch_own_for_repo, owner, name): (owner, name)
-            for owner, name in CONFIG["repos"]
-        }
-        for fut in as_completed(futures):
-            owner, name = futures[fut]
-            results[(owner, name)] = fut.result()
-
+    """Raises on fetch failure so the caller can keep the last good table."""
+    results = fetch_own_prs()
     body = ""
-    errors = []
-    for owner, name in CONFIG["repos"]:
-        result = results.get((owner, name))
-        if result is None:
-            continue
-        if result[0] == "error":
-            errors.append((name, result[3]))
-        else:
-            _, _, _, active, drafts = result
-            if not active and not drafts:
-                continue
-            body += repo_group_row(name, MY_PR_COLS) + render_own_prs_rows(active, drafts)
-
-    return wrap_table(MY_PR_HEAD, body, "No open PRs found."), errors
+    for repo in CONFIG["repos"]:
+        if repo in results:
+            active, drafts = results[repo]
+            if active or drafts:
+                body += repo_group_row(repo[1], MY_PR_COLS) + render_own_prs_rows(active, drafts)
+    return wrap_table(MY_PR_HEAD, body, "No open PRs found.")
 
 
 def errors_footnote(errors):
@@ -856,7 +754,7 @@ def errors_footnote(errors):
     if not errors:
         return ""
     names = ", ".join(html_mod.escape(name) for name, _ in errors)
-    return (f'<details class="errors-footnote"><summary>{len(errors)} repos failed to fetch: '
+    return (f'<details class="errors-footnote"><summary>{len(errors)} fetches failed: '
             f'{names}</summary>{build_errors_body(errors)}</details>')
 
 
@@ -868,70 +766,33 @@ def build_errors_body(errors):
         rows += (f'<tr><td class="error-repo">{html_mod.escape(repo)}</td>'
                  f'<td class="error-msg">{html_mod.escape(msg)}</td></tr>')
     head = ('<colgroup><col style="width:18%"><col style="width:82%"></colgroup>'
-            '<thead><tr><th>Repo</th><th>Error</th></tr></thead>')
+            '<thead><tr><th>Scope</th><th>Error</th></tr></thead>')
     return f'<table>{head}<tbody>{rows}</tbody></table>'
 
 
-def build_review_body():
+def _build_grouped_body(fetch, cols, head, render, empty_msg, label):
     error = gh_health()
     if error:
         return gh_error_banner(error)
-    results = {}
-    with ThreadPoolExecutor(max_workers=len(CONFIG["repos"])) as pool:
-        futures = {
-            pool.submit(_fetch_review_for_repo, owner, name): (owner, name)
-            for owner, name in CONFIG["repos"]
-        }
-        for fut in as_completed(futures):
-            owner, name = futures[fut]
-            results[(owner, name)] = fut.result()
-
+    try:
+        results = fetch()
+    except Exception as e:
+        return errors_footnote([(label, str(e))])
     body = ""
-    errors = []
-    for owner, name in CONFIG["repos"]:
-        result = results.get((owner, name))
-        if result is None:
-            continue
-        if result[0] == "error":
-            errors.append((name, result[3]))
-        else:
-            _, _, _, review_prs = result
-            if not review_prs:
-                continue
-            body += repo_group_row(name, REVIEW_COLS) + render_review_rows(review_prs)
+    for repo in CONFIG["repos"]:
+        if results.get(repo):
+            body += repo_group_row(repo[1], cols) + render(results[repo])
+    return wrap_table(head, body, empty_msg)
 
-    return wrap_table(REVIEW_HEAD, body, "No PRs waiting for your review.") + errors_footnote(errors)
+
+def build_review_body():
+    return _build_grouped_body(fetch_review_prs, REVIEW_COLS, REVIEW_HEAD, render_review_rows,
+                               "No PRs waiting for your review.", "Review queue")
 
 
 def build_merged_body():
-    error = gh_health()
-    if error:
-        return gh_error_banner(error)
-    results = {}
-    with ThreadPoolExecutor(max_workers=len(CONFIG["repos"])) as pool:
-        futures = {
-            pool.submit(_fetch_merged_for_repo, owner, name): (owner, name)
-            for owner, name in CONFIG["repos"]
-        }
-        for fut in as_completed(futures):
-            owner, name = futures[fut]
-            results[(owner, name)] = fut.result()
-
-    body = ""
-    errors = []
-    for owner, name in CONFIG["repos"]:
-        result = results.get((owner, name))
-        if result is None:
-            continue
-        if result[0] == "error":
-            errors.append((name, result[3]))
-        else:
-            _, _, _, merged_prs = result
-            if not merged_prs:
-                continue
-            body += repo_group_row(name, MERGED_COLS) + render_merged_rows(merged_prs)
-
-    return wrap_table(MERGED_HEAD, body, "No recently merged PRs found.") + errors_footnote(errors)
+    return _build_grouped_body(fetch_merged_prs, MERGED_COLS, MERGED_HEAD, render_merged_rows,
+                               "No recently merged PRs found.", "Recently merged")
 
 
 def build_full_page(my_prs_html, fetched_epoch, gh_error=None, errors=None):
@@ -1274,12 +1135,19 @@ def refresh_repos():
 def refresh_cache():
     refresh_repos()
     error = gh_health()
-    my_prs_html, errors = ("", []) if error else build_my_prs_body()
-    epoch = int(time.time())
+    errors = []
+    with _cache_lock:
+        my_prs_html, epoch = _cache["my_prs_html"], _cache["fetched_epoch"]
+    if not error:
+        try:
+            my_prs_html, epoch = build_my_prs_body(), int(time.time())
+        except Exception as e:
+            # Keep the last good table (e.g. while rate-limited) and surface the failure.
+            errors = [("My PRs", str(e))]
     with _cache_lock:
         _cache["my_prs_html"] = my_prs_html
         _cache["errors"] = errors
-        _cache["fetched_epoch"] = epoch
+        _cache["fetched_epoch"] = epoch or int(time.time())
         _cache["gh_error"] = error
 
 
