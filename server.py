@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PR Status Dashboard - a local web dashboard showing your GitHub PR status.
+"""PR inbox - a local web dashboard showing your GitHub PR status.
 
 Usage:
     python3 server.py https://github.com/org/repo1 https://github.com/org/repo2 ...
@@ -14,7 +14,6 @@ Prerequisites:
 """
 
 import argparse
-import html as html_mod
 import json
 import os
 import re
@@ -22,15 +21,16 @@ import subprocess
 import sys
 import threading
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 # Known bot accounts - comments from anyone else are "human"
 BOT_AUTHORS = {
     "yupp-reviews", "gemini-code-assist", "copilot", "github-actions",
     "dependabot", "renovate", "codecov", "sonarcloud", "vercel",
+    "cursor", "devin-ai-integration",
 }
 
 # Populated at startup
@@ -42,13 +42,15 @@ CONFIG = {
     "interval": 300,
 }
 
-# Global cache
+# Global cache of the user's own PRs (the only scope refreshed in the background)
 _cache_lock = threading.Lock()
-_cache = {"my_prs_html": "", "errors": [], "fetched_epoch": 0, "gh_error": None}
+_cache = {"items": [], "errors": [], "fetched_epoch": 0, "gh_error": None}
 
 # Track last page visit so background refresh pauses when page is closed
 _last_visit_lock = threading.Lock()
 _last_visit = {"t": 0.0}
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +75,7 @@ def parse_repo_url(url):
 
 def load_config_file():
     """Load config.yml from the same directory as this script. Returns dict or None."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "config.yml")
+    config_path = os.path.join(SCRIPT_DIR, "config.yml")
 
     if not os.path.exists(config_path):
         return None
@@ -167,8 +168,8 @@ def gh_health():
 
     A long-running daemon commonly loses access to the macOS login keychain
     where `gh` stores its token; afterwards every `gh` call fails and the
-    dashboard would otherwise just show an empty "No open PRs found". This
-    check lets the UI say what's actually wrong and that a restart is needed."""
+    dashboard would otherwise just show an empty inbox. This check lets the
+    UI say what's actually wrong and that a restart is needed."""
     try:
         result = subprocess.run(
             ["gh", "api", "user", "--jq", ".login"],
@@ -183,25 +184,6 @@ def gh_health():
                 return line.strip()[:200]
         return "gh authentication failed"
     return None
-
-
-def time_ago(iso_str):
-    """Convert an ISO timestamp to a human-readable relative time string."""
-    if not iso_str:
-        return ""
-    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    delta = datetime.now(timezone.utc) - dt
-    secs = int(delta.total_seconds())
-    if secs < 60:
-        return "just now"
-    mins = secs // 60
-    if mins < 60:
-        return f"{mins}m ago"
-    hours = mins // 60
-    if hours < 24:
-        return f"{hours}h ago"
-    days = hours // 24
-    return f"{days}d ago"
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +207,8 @@ HARNESS_SPECS = [
     ("codex", "Codex", "openai.svg", r"\bcodex\b"),
     ("cursor", "Cursor", "cursor.png", r"\bcursor\b"),
 ]
-HARNESS_BY_KEY = {key: (label, logo) for key, label, logo, _ in HARNESS_SPECS}
-LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
+HARNESSES = {key: {"label": label, "logo": logo} for key, label, logo, _ in HARNESS_SPECS}
+LOGO_DIR = os.path.join(SCRIPT_DIR, "logos")
 LOGO_FILES = {logo for _, _, logo, _ in HARNESS_SPECS}
 
 # Session-link hosts are the most reliable signal, so they're checked first.
@@ -272,15 +254,6 @@ def detect_harness(body):
     return None, ""
 
 
-def annotate_harness(prs):
-    """Attach harness/session fields and drop the body -- it's only needed here."""
-    for pr in prs:
-        key, session_url = detect_harness(pr.pop("body", ""))
-        pr["harness"] = key
-        pr["harnessSession"] = session_url
-    return prs
-
-
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
@@ -308,15 +281,8 @@ def gh_search_prs(query, fields, page_size=50, max_results=1000):
         cursor = search["pageInfo"]["endCursor"]
 
 
-def group_by_repo(prs):
-    """{(owner, name): [prs]} for configured repos only."""
-    wanted = {f"{o}/{n}": (o, n) for o, n in CONFIG["repos"]}
-    grouped = {}
-    for pr in prs:
-        key = wanted.get(pr["repository"]["nameWithOwner"])
-        if key:
-            grouped.setdefault(key, []).append(pr)
-    return grouped
+def wanted_repos():
+    return {f"{o}/{n}": (o, n) for o, n in CONFIG["repos"]}
 
 
 def owner_qualifiers():
@@ -329,791 +295,320 @@ def _nodes(obj, *path):
     return (obj or {}).get("nodes") or []
 
 
-def _normalize_check(c):
-    if "context" in c:  # legacy commit status: has state, not status/conclusion
-        state = c.get("state", "")
-        done = state not in ("PENDING", "EXPECTED")
-        return {"name": c["context"], "status": "COMPLETED" if done else "IN_PROGRESS",
-                "conclusion": state if done else ""}
-    return c
+def _login(obj):
+    return ((obj or {}).get("login") or "").strip()
+
+
+def is_bot(login):
+    low = (login or "").lower()
+    return low in BOT_AUTHORS or "[bot]" in low
+
+
+def _check(c):
+    """Normalise a CheckRun or legacy StatusContext into {name, state, url}
+    where state is pass | fail | pending | skipped."""
+    if "context" in c:
+        st = c.get("state", "")
+        state = ("pending" if st in ("PENDING", "EXPECTED") else
+                 "pass" if st == "SUCCESS" else "fail")
+        return {"name": c["context"], "state": state, "url": c.get("targetUrl") or ""}
+    conclusion = c.get("conclusion") or ""
+    if c.get("status") != "COMPLETED":
+        state = "pending"
+    elif conclusion in ("SUCCESS", "NEUTRAL"):
+        state = "pass"
+    elif conclusion == "SKIPPED":
+        state = "skipped"
+    else:
+        state = "fail"
+    return {"name": c.get("name", ""), "state": state, "url": c.get("detailsUrl") or ""}
+
+
+def ci_summary(rollup_nodes):
+    checks = [_check(c) for c in rollup_nodes if c]
+    checks = [c for c in checks if c["state"] != "skipped"]
+    failed = [c for c in checks if c["state"] == "fail"]
+    pending = [c for c in checks if c["state"] == "pending"]
+    state = "none" if not checks else "fail" if failed else "pending" if pending else "pass"
+    return {"state": state, "total": len(checks), "failed": failed, "pending": [c["name"] for c in pending]}
+
+
+def merge_state(pr):
+    mergeable = pr.get("mergeable", "")
+    ms = pr.get("mergeStateStatus", "")
+    if ms == "BEHIND":
+        return "behind"
+    if ms == "DIRTY" or mergeable == "CONFLICTING":
+        return "conflict"
+    if ms == "BLOCKED":
+        return "blocked"
+    if ms == "CLEAN" or mergeable == "MERGEABLE":
+        return "ok"
+    if mergeable == "UNKNOWN":
+        return "unknown"
+    return ""
+
+
+BODY_LIMIT = 6000
+COMMENT_LIMIT = 400
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+
+
+def clip(text, limit):
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + " …"
+
+
+def base_item(pr, scope):
+    repo_full = pr["repository"]["nameWithOwner"]
+    owner, name = repo_full.split("/", 1)
+    body = pr.get("body") or ""
+    harness, session = detect_harness(body)
+    return {
+        "id": f"{repo_full}#{pr['number']}",
+        "scope": scope,
+        "owner": owner, "repo": name, "number": pr["number"],
+        "title": pr.get("title") or "", "url": pr.get("url") or "",
+        "author": _login(pr.get("author")),
+        "isDraft": bool(pr.get("isDraft")),
+        "createdAt": pr.get("createdAt") or "",
+        "updatedAt": pr.get("updatedAt") or pr.get("createdAt") or "",
+        "mergedAt": pr.get("mergedAt") or "",
+        "harness": harness, "harnessSession": session,
+        "body": clip(body, BODY_LIMIT),
+        "additions": pr.get("additions", 0), "deletions": pr.get("deletions", 0),
+        "changedFiles": pr.get("changedFiles", 0),
+    }
+
+
+def review_fields(pr, item):
+    reviews = _nodes(pr, "reviews")
+    # Latest review per author decides their stance, so an old "changes
+    # requested" that was later approved doesn't keep blocking.
+    latest = {}
+    for r in reviews:
+        login = _login(r.get("author"))
+        if login and r.get("state") in ("APPROVED", "CHANGES_REQUESTED"):
+            latest[login] = r["state"]
+    item["reviewDecision"] = pr.get("reviewDecision") or ""
+    item["approvers"] = sorted(l for l, s in latest.items() if s == "APPROVED")
+    item["changesRequestedBy"] = sorted(l for l, s in latest.items() if s == "CHANGES_REQUESTED")
+    item["approvals"] = len(item["approvers"])
+
+
+def names(logins, limit=3):
+    logins = list(logins)
+    shown = ", ".join("@" + l for l in logins[:limit])
+    return shown + (f" +{len(logins) - limit}" if len(logins) > limit else "")
+
+
+def approval_text(item):
+    if item["changesRequestedBy"]:
+        return f"Changes requested by {names(item['changesRequestedBy'])}"
+    if item["approvals"]:
+        txt = f"Approved by {names(item['approvers'])}"
+        if item["reviewDecision"] == "REVIEW_REQUIRED":
+            txt += ", needs more"
+        return txt
+    if item["reviewDecision"] == "REVIEW_REQUIRED":
+        return "Review required"
+    return "No reviews"
+
+
+def ci_text(ci):
+    if ci["state"] == "none":
+        return "No CI"
+    if ci["state"] == "fail":
+        shown = ", ".join(c["name"] for c in ci["failed"][:3])
+        extra = f" +{len(ci['failed']) - 3}" if len(ci["failed"]) > 3 else ""
+        return f"CI failing: {shown}{extra}"
+    if ci["state"] == "pending":
+        return f"CI running ({len(ci['pending'])})"
+    return "CI passing"
+
+
+MERGE_TEXT = {"behind": "behind main", "conflict": "merge conflicts", "ok": "up to date",
+              "blocked": "", "unknown": "mergeability unknown", "": ""}
+
+
+def classify_mine(item):
+    """Set status, ask (what the user must do, empty when nothing) and summary."""
+    ci, merge = item["ci"], item["merge"]
+    unresolved = item["unresolved"]
+    parts = [approval_text(item), ci_text(ci)]
+    if MERGE_TEXT[merge]:
+        parts.append(MERGE_TEXT[merge])
+    if unresolved:
+        parts.insert(0, f"{len(unresolved)} unresolved")
+    item["summary"] = " · ".join(parts)
+
+    if item["isDraft"]:
+        item["status"], item["ask"] = "draft", ""
+        return
+    if merge == "conflict":
+        item["status"], item["ask"] = "action", "Resolve merge conflicts"
+        return
+    if ci["state"] == "fail":
+        shown = ", ".join(c["name"] for c in ci["failed"][:2])
+        extra = f" +{len(ci['failed']) - 2}" if len(ci["failed"]) > 2 else ""
+        item["status"], item["ask"] = "action", f"Fix CI: {shown}{extra}"
+        return
+    if item["changesRequestedBy"]:
+        item["status"], item["ask"] = "action", f"Address changes requested by {names(item['changesRequestedBy'])}"
+        return
+    if unresolved:
+        humans = sorted({t["author"] for t in unresolved if t["human"]})
+        bots = sorted({t["author"] for t in unresolved if not t["human"]})
+        n = len(unresolved)
+        who = names(humans + bots)
+        item["status"], item["ask"] = "action", f"Reply to {n} unresolved comment{'s' if n > 1 else ''} from {who}"
+        return
+    if item["reviewDecision"] == "APPROVED":
+        if ci["state"] == "pending":
+            item["status"], item["ask"] = "running", ""
+        elif merge == "behind":
+            item["status"], item["ask"] = "ready", "Update branch, then merge"
+        else:
+            item["status"], item["ask"] = "ready", "Merge it"
+        return
+    if ci["state"] == "pending":
+        item["status"], item["ask"] = "running", ""
+        return
+    item["status"], item["ask"] = "waiting", ""
+
+
+def fingerprint(item):
+    return "|".join(str(x) for x in (
+        item["updatedAt"], item.get("status"), len(item.get("unresolved", [])),
+        item.get("ci", {}).get("state"), item.get("reviewDecision"), item.get("merge"),
+    ))
 
 
 OWN_PR_FIELDS = """
-    number title body isDraft createdAt url reviewDecision mergeable mergeStateStatus
-    reviews(last: 50) { nodes { state createdAt } }
+    number title body isDraft createdAt updatedAt url reviewDecision mergeable mergeStateStatus
+    additions deletions changedFiles
+    author { login }
+    reviews(last: 50) { nodes { state createdAt author { login } } }
     comments(last: 1) { nodes { createdAt } }
     commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 50) { nodes {
-        ... on CheckRun { name status conclusion }
-        ... on StatusContext { context state } } } } } } }
-    reviewThreads(first: 50) { nodes { isResolved comments(first: 1) { nodes { author { login } } } } }
+        ... on CheckRun { name status conclusion detailsUrl }
+        ... on StatusContext { context state targetUrl } } } } } } }
+    reviewThreads(first: 50) { nodes { isResolved
+        comments(first: 1) { nodes { author { login } body url path createdAt } } } }
     latestThread: reviewThreads(last: 1) { nodes { comments(last: 1) { nodes { createdAt } } } }
 """
 
 
-def fetch_own_prs():
-    """{(owner, name): (active, drafts)} for the user's open PRs."""
+def fetch_mine():
+    """The user's open PRs (drafts only from the past 30 days), as inbox items."""
     thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-    prs = annotate_harness(gh_search_prs(
-        f"is:pr is:open archived:false author:{CONFIG['gh_user']} {owner_qualifiers()}", OWN_PR_FIELDS, page_size=25))
+    prs = gh_search_prs(
+        f"is:pr is:open archived:false author:{CONFIG['gh_user']} {owner_qualifiers()}",
+        OWN_PR_FIELDS, page_size=25)
+    wanted = wanted_repos()
+    items = []
     for pr in prs:
-        reviews = _nodes(pr, "reviews")
-        pr["reviewStates"] = [r.get("state", "") for r in reviews]
+        if pr["repository"]["nameWithOwner"] not in wanted:
+            continue
+        item = base_item(pr, "mine")
+        if item["isDraft"] and datetime.fromisoformat(item["createdAt"].replace("Z", "+00:00")) < thirty_days_ago:
+            continue
+        review_fields(pr, item)
         commits = _nodes(pr, "commits")
         rollup = (commits[0]["commit"].get("statusCheckRollup") if commits else None) or {}
-        pr["statusCheckRollup"] = [_normalize_check(c) for c in _nodes(rollup, "contexts") if c]
-        pr["unresolvedThreads"] = [
-            ((_nodes(t, "comments") or [{}])[0].get("author") or {}).get("login", "unknown")
-            for t in _nodes(pr, "reviewThreads")
-            if not t.get("isResolved") and _nodes(t, "comments")
-        ]
+        item["ci"] = ci_summary(_nodes(rollup, "contexts"))
+        item["merge"] = merge_state(pr)
+        item["unresolved"] = []
+        for t in _nodes(pr, "reviewThreads"):
+            first = (_nodes(t, "comments") or [None])[0]
+            if t.get("isResolved") or not first:
+                continue
+            login = _login(first.get("author")) or "unknown"
+            item["unresolved"].append({
+                "author": login, "human": not is_bot(login),
+                "body": clip(_HTML_COMMENT_RE.sub("", first.get("body") or ""), COMMENT_LIMIT),
+                "url": first.get("url") or "", "path": first.get("path") or "",
+                "createdAt": first.get("createdAt") or "",
+            })
         timestamps = [c.get("createdAt") for c in _nodes(pr, "comments")]
-        timestamps += [r.get("createdAt") for r in reviews[-1:]]
+        timestamps += [r.get("createdAt") for r in _nodes(pr, "reviews")[-1:]]
         for t in _nodes(pr, "latestThread"):
             timestamps += [c.get("createdAt") for c in _nodes(t, "comments")]
-        pr["lastCommentAt"] = max((t for t in timestamps if t), default="")
-
-    result = {}
-    for repo, repo_prs in group_by_repo(prs).items():
-        active, drafts = [], []
-        for pr in repo_prs:
-            if not pr.get("isDraft"):
-                active.append(pr)
-            elif datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00")) >= thirty_days_ago:
-                drafts.append(pr)
-        result[repo] = (active, drafts)
-    return result
+        item["lastCommentAt"] = max((t for t in timestamps if t), default="")
+        classify_mine(item)
+        item["fp"] = fingerprint(item)
+        items.append(item)
+    return items
 
 
-def fetch_review_prs():
-    """{(owner, name): [prs]} of open PRs from the past 2 days waiting for review
-    (not authored by user, not draft, not approved)."""
+REVIEW_FIELDS = """
+    number title body isDraft createdAt updatedAt url reviewDecision
+    additions deletions changedFiles
+    author { login }
+    reviews(last: 30) { nodes { state author { login } } }
+    reviewRequests(first: 20) { nodes { requestedReviewer {
+        ... on User { login } ... on Team { slug } } } }
+"""
+
+
+def fetch_review():
+    """Open PRs from the past 2 days by others, not yet approved, waiting for review."""
     gh_user = CONFIG["gh_user"]
     since = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     query = (f"is:pr is:open -review:approved -is:draft -author:{gh_user} "
              f"created:>={since} {owner_qualifiers()}")
-    fields = "number title body createdAt url author { login } reviews(last: 30) { nodes { state } }"
-    prs = annotate_harness(gh_search_prs(query, fields))
-    for pr in prs:
-        pr["reviewStates"] = [r.get("state", "") for r in _nodes(pr, "reviews")]
-        pr["otherApprovals"] = pr["reviewStates"].count("APPROVED")
-        pr["authorLogin"] = (pr.get("author") or {}).get("login", "")
-    return group_by_repo(prs)
+    wanted = wanted_repos()
+    items = []
+    for pr in gh_search_prs(query, REVIEW_FIELDS):
+        if pr["repository"]["nameWithOwner"] not in wanted:
+            continue
+        item = base_item(pr, "review")
+        review_fields(pr, item)
+        requested = [_login(r.get("requestedReviewer")) for r in _nodes(pr, "reviewRequests")]
+        item["requested"] = gh_user in requested
+        item["ci"] = {"state": "none", "total": 0, "failed": [], "pending": []}
+        item["merge"] = ""
+        item["unresolved"] = []
+        item["lastCommentAt"] = ""
+        item["status"] = "review"
+        item["ask"] = ("Review requested from you" if item["requested"]
+                       else f"Review @{item['author']}'s PR")
+        size = f"+{item['additions']} −{item['deletions']} in {item['changedFiles']} file{'s' if item['changedFiles'] != 1 else ''}"
+        item["summary"] = f"{approval_text(item)} · {size}"
+        item["fp"] = fingerprint(item)
+        items.append(item)
+    return items
 
 
-def fetch_merged_prs():
-    """{(owner, name): [prs]} of the user's 5 most recently merged PRs per repo."""
+def fetch_merged():
+    """The user's 5 most recently merged PRs per repo."""
     # ponytail: only the 100 most recently updated merged PRs are scanned; a repo
     # whose last merge is older drops off. Raise max_results if that matters.
-    prs = annotate_harness(gh_search_prs(
+    prs = gh_search_prs(
         f"is:pr is:merged author:{CONFIG['gh_user']} sort:updated-desc {owner_qualifiers()}",
-        "number title body url createdAt mergedAt", max_results=100))
-    grouped = group_by_repo(prs)
-    for repo in grouped:
-        grouped[repo] = sorted(grouped[repo], key=lambda p: p.get("mergedAt", ""), reverse=True)[:5]
-    return grouped
-
-
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
-
-def approval_badge(pr):
-    decision = pr.get("reviewDecision") or ""
-    reviews = pr.get("reviewStates", [])
-    approvals = sum(1 for r in reviews if r == "APPROVED")
-
-    if decision == "APPROVED":
-        return f'<span class="badge approved">Approved ({approvals})</span>'
-    elif decision == "CHANGES_REQUESTED":
-        return '<span class="badge changes">Changes Requested</span>'
-    elif decision == "REVIEW_REQUIRED":
-        if approvals > 0:
-            return f'<span class="badge partial">Approved ({approvals}), needs more</span>'
-        return '<span class="badge pending">Review Required</span>'
-    else:
-        if approvals > 0:
-            return f'<span class="badge partial">Approved ({approvals})</span>'
-        return '<span class="badge none">No Reviews</span>'
-
-
-def unresolved_badge(pr):
-    threads = pr.get("unresolvedThreads", [])
-    if not threads:
-        return '<span class="resolved">0</span>'
-
-    counts = Counter(threads)
-    total = len(threads)
-
-    human_parts = []
-    bot_parts = []
-    for author, count in counts.most_common():
-        label = f"{author} ({count})" if count > 1 else author
-        if author.lower() in BOT_AUTHORS or "[bot]" in author.lower():
-            bot_parts.append(html_mod.escape(label))
-        else:
-            human_parts.append(f'<strong>{html_mod.escape(label)}</strong>')
-
-    all_parts = human_parts + bot_parts
-    detail = ", ".join(all_parts)
-
-    has_human = len(human_parts) > 0
-    cls = "unresolved-human" if has_human else "unresolved-bot"
-    return f'<span class="badge {cls}">{total}</span> <span class="comment-detail">{detail}</span>'
-
-
-def ci_badge(pr):
-    checks = pr.get("statusCheckRollup") or []
-    if not checks:
-        return '<span class="badge none">No CI</span>'
-
-    failed = []
-    pending = []
-    for check in checks:
-        status = check.get("status", "")
-        conclusion = check.get("conclusion", "")
-        if conclusion == "SKIPPED":
-            continue
-        if status != "COMPLETED":
-            pending.append(check.get("name", ""))
-        elif conclusion not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-            failed.append(check.get("name", ""))
-
-    if failed:
-        names = ", ".join(failed[:3])
-        extra = f" +{len(failed) - 3}" if len(failed) > 3 else ""
-        return f'<span class="badge ci-fail">{html_mod.escape(names)}{extra}</span>'
-    elif pending:
-        return f'<span class="badge ci-pending">Running ({len(pending)})</span>'
-    else:
-        return '<span class="badge ci-pass">Passing</span>'
-
-
-def merge_badge(pr):
-    mergeable = pr.get("mergeable", "")
-    merge_state = pr.get("mergeStateStatus", "")
-
-    if merge_state == "BEHIND":
-        return '<span class="badge merge-behind">Behind main</span>'
-    elif merge_state == "DIRTY" or mergeable == "CONFLICTING":
-        return '<span class="badge merge-conflict">Conflicts</span>'
-    elif merge_state == "BLOCKED":
-        return ""
-    elif merge_state == "CLEAN" or mergeable == "MERGEABLE":
-        return '<span class="badge merge-ok">Up to date</span>'
-    elif mergeable == "UNKNOWN":
-        return '<span class="badge none">Checking...</span>'
-    return ""
-
-
-def _approval_sort_key(pr):
-    """0 = fully approved, 1 = partial approval, 2 = review required, 3 = changes requested, 4 = no reviews."""
-    decision = pr.get("reviewDecision") or ""
-    reviews = pr.get("reviewStates", [])
-    approvals = sum(1 for r in reviews if r == "APPROVED")
-
-    if decision == "APPROVED":
-        return 0
-    elif decision == "CHANGES_REQUESTED":
-        return 3
-    elif decision == "REVIEW_REQUIRED":
-        return 1 if approvals > 0 else 2
-    else:
-        return 1 if approvals > 0 else 4
-
-
-def _unresolved_sort_key(pr):
-    """Number of unresolved threads."""
-    return len(pr.get("unresolvedThreads", []))
-
-
-def _ci_sort_key(pr):
-    """0 = passing, 1 = pending/other, 2 = failing."""
-    checks = pr.get("statusCheckRollup") or []
-    if not checks:
-        return 1
-    for check in checks:
-        conclusion = check.get("conclusion", "")
-        if conclusion == "SKIPPED":
-            continue
-        if check.get("status", "") != "COMPLETED":
-            continue
-        if conclusion not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-            return 2
-    for check in checks:
-        if check.get("conclusion") == "SKIPPED":
-            continue
-        if check.get("status", "") != "COMPLETED":
-            return 1
-    return 0
-
-
-def default_sort_prs(prs):
-    """Sort PRs: approved first, then by unresolved count, then by CI status, then oldest first."""
-    return sorted(prs, key=lambda p: (
-        _approval_sort_key(p),
-        _unresolved_sort_key(p),
-        _ci_sort_key(p),
-        p.get("createdAt", ""),
-    ))
-
-
-# --- Shared table scaffolding -------------------------------------------------
-# Each tab renders as ONE table: a single sticky header on top, then repo rows
-# introduced by group rows. Column widths are fixed so everything lines up.
-
-MY_PR_COLS = 9
-MY_PR_HEAD = (
-    '<colgroup><col style="width:6%"><col style="width:11%"><col style="width:28%">'
-    '<col style="width:8%"><col style="width:9%"><col style="width:10%">'
-    '<col style="width:11%"><col style="width:10%"><col style="width:7%"></colgroup>'
-    '<thead><tr><th>PR</th><th>Harness</th><th>Title</th><th>Created</th><th>Last Comment</th>'
-    '<th>Unresolved Comments</th><th>Approval</th><th>CI</th><th>Branch</th></tr></thead>'
-)
-
-REVIEW_COLS = 5
-REVIEW_HEAD = (
-    '<colgroup><col style="width:7%"><col style="width:11%"><col style="width:52%">'
-    '<col style="width:15%"><col style="width:15%"></colgroup>'
-    '<thead><tr><th>PR</th><th>Harness</th><th>Title</th><th>Created</th><th>Status</th></tr></thead>'
-)
-
-MERGED_COLS = 5
-MERGED_HEAD = (
-    '<colgroup><col style="width:7%"><col style="width:11%"><col style="width:52%">'
-    '<col style="width:15%"><col style="width:15%"></colgroup>'
-    '<thead><tr><th>PR</th><th>Harness</th><th>Title</th><th>Created</th><th>Merged</th></tr></thead>'
-)
-
-
-def harness_cell(pr):
-    """Harness logo, plus the harness name linking to its session when one is stamped."""
-    key = pr.get("harness")
-    if not key:
-        return '<td class="harness-col" data-sort="zzz"><span class="muted">--</span></td>'
-    label, logo = HARNESS_BY_KEY[key]
-    label_attr = html_mod.escape(label, quote=True)
-    chip = (f'<img class="harness-logo" src="/logos/{logo}" alt="{label_attr}" '
-            f'title="{label_attr}">')
-    url = pr.get("harnessSession") or ""
-    session = ""
-    if url:
-        session = (f'<a class="harness-session" href="{html_mod.escape(url, quote=True)}" '
-                   f'target="_blank">{label_attr}</a>')
-    return f'<td class="harness-col" data-sort="{key}">{chip}{session}</td>'
-
-
-def repo_group_row(name, colspan):
-    return (f'<tr class="group-row"><td colspan="{colspan}">'
-            f'<span class="group-label">{html_mod.escape(name)}</span></td></tr>')
-
-
-def subgroup_row(label_html, colspan):
-    return f'<tr class="subgroup-row"><td colspan="{colspan}">{label_html}</td></tr>'
-
-
-def note_row(text, colspan):
-    return (f'<tr class="note-row"><td colspan="{colspan}">'
-            f'<span class="empty">{html_mod.escape(text)}</span></td></tr>')
-
-
-def wrap_table(head, body, empty_msg):
-    if not body:
-        return f'<p class="empty">{empty_msg}</p>'
-    return f'<table class="sortable">{head}<tbody>{body}</tbody></table>'
-
-
-def render_pr_rows(prs):
-    rows = ""
-    for pr in default_sort_prs(prs):
-        num = pr["number"]
-        title = pr["title"]
-        url = pr["url"]
-        approval = approval_badge(pr)
-        draft_tag = ' <span class="badge draft">Draft</span>' if pr.get("isDraft") else ""
-
-        unresolved_count = len(pr.get("unresolvedThreads", []))
-        comments_col = f'<td data-sort="{unresolved_count}">{unresolved_badge(pr)}</td>'
-
-        created_iso = pr.get("createdAt", "")
-        created_col = f'<td class="time-col" data-sort="{created_iso}">{time_ago(created_iso)}</td>'
-
-        last_comment = pr.get("lastCommentAt", "")
-        last_comment_display = time_ago(last_comment) if last_comment else '<span class="muted">--</span>'
-        last_comment_col = f'<td class="time-col" data-sort="{last_comment}">{last_comment_display}</td>'
-
-        approval_td = f'<td data-sort="{_approval_sort_key(pr)}">{approval}</td>'
-        ci_col = f'<td data-sort="{_ci_sort_key(pr)}">{ci_badge(pr)}</td>'
-        merge_col = f"<td>{merge_badge(pr)}</td>"
-
-        rows += f"""<tr>
-            <td data-sort="{num}"><a href="{url}" target="_blank">#{num}</a></td>
-            {harness_cell(pr)}
-            <td data-sort="{html_mod.escape(title)}"><a href="{url}" target="_blank">{html_mod.escape(title)}</a>{draft_tag}</td>
-            {created_col}
-            {last_comment_col}
-            {comments_col}
-            {approval_td}
-            {ci_col}
-            {merge_col}
-        </tr>"""
-    return rows
-
-
-def render_own_prs_rows(active, drafts):
-    """Active PRs first (no label -- the repo group row says it all), then drafts
-    under their own subgroup label since that window is time-boxed."""
-    rows = render_pr_rows(active)
-    if drafts:
-        rows += subgroup_row(
-            f'Drafts (past 30d) <span class="count">({len(drafts)})</span>', MY_PR_COLS)
-        rows += render_pr_rows(drafts)
-    return rows
-
-
-def render_review_rows(prs):
-    """Review PRs grouped by author, oldest first within a group, groups ordered
-    by their oldest PR."""
-    groups = {}
+        "number title body url createdAt updatedAt mergedAt author { login } additions deletions changedFiles",
+        max_results=100)
+    wanted = wanted_repos()
+    per_repo = {}
     for pr in prs:
-        groups.setdefault(pr.get("authorLogin", "unknown"), []).append(pr)
-    for author in groups:
-        groups[author].sort(key=lambda p: p.get("createdAt", ""))
-    sorted_groups = sorted(groups.items(), key=lambda g: g[1][0].get("createdAt", ""))
-
-    rows = ""
-    for author, author_prs in sorted_groups:
-        author_esc = html_mod.escape(author)
-        rows += subgroup_row(
-            f'@{author_esc} <span class="count">({len(author_prs)})</span>', REVIEW_COLS)
-        for pr in author_prs:
-            num = pr["number"]
-            url = pr["url"]
-            title = html_mod.escape(pr["title"])
-            created_iso = pr.get("createdAt", "")
-            approvals = pr.get("otherApprovals", 0)
-            if approvals > 0:
-                approval_html = f'<span class="badge partial">Approved ({approvals})</span>'
-            else:
-                approval_html = '<span class="badge pending">No approvals</span>'
-            rows += f"""<tr>
-                <td data-sort="{num}"><a href="{url}" target="_blank">#{num}</a></td>
-                {harness_cell(pr)}
-                <td data-sort="{title}"><a href="{url}" target="_blank">{title}</a></td>
-                <td class="time-col" data-sort="{created_iso}">{time_ago(created_iso)}</td>
-                <td>{approval_html}</td>
-            </tr>"""
-    return rows
+        full = pr["repository"]["nameWithOwner"]
+        if full in wanted:
+            per_repo.setdefault(full, []).append(pr)
+    items = []
+    for full, repo_prs in per_repo.items():
+        repo_prs.sort(key=lambda p: p.get("mergedAt", ""), reverse=True)
+        for pr in repo_prs[:5]:
+            item = base_item(pr, "merged")
+            item.update({"reviewDecision": "", "approvers": [], "changesRequestedBy": [], "approvals": 0,
+                         "ci": {"state": "none", "total": 0, "failed": [], "pending": []},
+                         "merge": "", "unresolved": [], "lastCommentAt": "",
+                         "status": "done", "ask": "", "summary": "Merged"})
+            item["fp"] = fingerprint(item)
+            items.append(item)
+    return items
 
 
-def render_merged_rows(prs):
-    rows = ""
-    for pr in prs:
-        num = pr["number"]
-        url = pr["url"]
-        title = html_mod.escape(pr["title"])
-        created_iso = pr.get("createdAt", "")
-        merged_iso = pr.get("mergedAt", "")
-        rows += f"""<tr>
-            <td data-sort="{num}"><a href="{url}" target="_blank">#{num}</a></td>
-            {harness_cell(pr)}
-            <td data-sort="{title}"><a href="{url}" target="_blank">{title}</a></td>
-            <td class="time-col" data-sort="{created_iso}">{time_ago(created_iso)}</td>
-            <td class="time-col" data-sort="{merged_iso}">{time_ago(merged_iso)}</td>
-        </tr>"""
-    return rows
-
-
-def gh_error_banner(msg):
-    """Prominent red banner shown when the GitHub CLI can't authenticate."""
-    return (
-        '<div class="gh-error">'
-        '⚠️ <strong>Can’t reach GitHub.</strong> '
-        'The GitHub CLI couldn’t authenticate'
-        f' (<code>{html_mod.escape(msg)}</code>). '
-        'The background daemon most likely lost access to your login keychain — '
-        'restart it from a terminal with <code>pr-status restart</code>.'
-        '</div>'
-    )
-
-
-def build_my_prs_body():
-    """Raises on fetch failure so the caller can keep the last good table."""
-    results = fetch_own_prs()
-    body = ""
-    for repo in CONFIG["repos"]:
-        if repo in results:
-            active, drafts = results[repo]
-            if active or drafts:
-                body += repo_group_row(repo[1], MY_PR_COLS) + render_own_prs_rows(active, drafts)
-    return wrap_table(MY_PR_HEAD, body, "No open PRs found.")
-
-
-def errors_footnote(errors):
-    """Compact expandable note for the on-demand tabs, so fetch errors stay out
-    of the main table but remain one click away."""
-    if not errors:
-        return ""
-    names = ", ".join(html_mod.escape(name) for name, _ in errors)
-    return (f'<details class="errors-footnote"><summary>{len(errors)} fetches failed: '
-            f'{names}</summary>{build_errors_body(errors)}</details>')
-
-
-def build_errors_body(errors):
-    if not errors:
-        return '<p class="empty">No fetch errors.</p>'
-    rows = ""
-    for repo, msg in errors:
-        rows += (f'<tr><td class="error-repo">{html_mod.escape(repo)}</td>'
-                 f'<td class="error-msg">{html_mod.escape(msg)}</td></tr>')
-    head = ('<colgroup><col style="width:18%"><col style="width:82%"></colgroup>'
-            '<thead><tr><th>Scope</th><th>Error</th></tr></thead>')
-    return f'<table>{head}<tbody>{rows}</tbody></table>'
-
-
-def _build_grouped_body(fetch, cols, head, render, empty_msg, label):
-    error = gh_health()
-    if error:
-        return gh_error_banner(error)
-    try:
-        results = fetch()
-    except Exception as e:
-        return errors_footnote([(label, str(e))])
-    body = ""
-    for repo in CONFIG["repos"]:
-        if results.get(repo):
-            body += repo_group_row(repo[1], cols) + render(results[repo])
-    return wrap_table(head, body, empty_msg)
-
-
-def build_review_body():
-    return _build_grouped_body(fetch_review_prs, REVIEW_COLS, REVIEW_HEAD, render_review_rows,
-                               "No PRs waiting for your review.", "Review queue")
-
-
-def build_merged_body():
-    return _build_grouped_body(fetch_merged_prs, MERGED_COLS, MERGED_HEAD, render_merged_rows,
-                               "No recently merged PRs found.", "Recently merged")
-
-
-def build_full_page(my_prs_html, fetched_epoch, gh_error=None, errors=None):
-    gh_user = html_mod.escape(CONFIG["gh_user"])
-    banner_html = gh_error_banner(gh_error) if gh_error else ""
-    if gh_error:
-        my_prs_html = '<p class="empty">PR data unavailable — see the warning above.</p>'
-    errors = errors or []
-    errors_tab_btn = ""
-    if errors:
-        errors_tab_btn = (f'<button class="tab-btn errors-tab" onclick="switchTab(\'errors\', this)">'
-                          f'Errors ({len(errors)})</button>')
-    errors_html = build_errors_body(errors)
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>PR Status - {gh_user}</title>
-<style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-           margin: 0; padding: 20px 40px; background: #fff; color: #1a1a1a; }}
-    h1 {{ margin-bottom: 4px; }}
-    .subtitle {{ color: #666; margin-bottom: 16px; font-size: 14px; display: flex; align-items: center; gap: 8px; }}
-    .count {{ color: #666; font-weight: normal; }}
-    table {{ width: 100%; border-collapse: collapse; margin-bottom: 12px; table-layout: fixed; }}
-    th {{ text-align: left; padding: 6px 12px; background: #f6f8fa; border-bottom: 2px solid #d0d7de;
-          font-size: 12px; color: #57606a; text-transform: uppercase; letter-spacing: 0.5px;
-          position: sticky; top: 0; z-index: 2; }}
-    td {{ padding: 6px 12px; border-bottom: 1px solid #e1e4e8; font-size: 14px; overflow-wrap: break-word; }}
-    td:first-child, th:first-child {{ white-space: nowrap; }}
-    tr:hover {{ background: #f6f8fa; }}
-    /* Per-repo section header inside the shared table */
-    .group-row td {{ padding: 28px 0 8px 0; border-bottom: none; }}
-    tbody tr.group-row:first-child td {{ padding-top: 12px; }}
-    .group-label {{ display: inline-block; font-size: 21px; font-weight: 700;
-                    border-left: 4px solid #0969da; padding-left: 12px; }}
-    .subgroup-row td {{ padding: 14px 12px 4px; font-size: 14px; font-weight: 600;
-                        color: #57606a; border-bottom: 1px solid #e1e4e8; }}
-    .group-row:hover, .subgroup-row:hover, .note-row:hover {{ background: none; }}
-    a {{ color: #0969da; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }}
-    .approved {{ background: #dafbe1; color: #116329; }}
-    .changes {{ background: #fff8c5; color: #7a4f01; }}
-    .pending {{ background: #ddf4ff; color: #0550ae; }}
-    .partial {{ background: #dafbe1; color: #116329; }}
-    .none {{ background: #f0f0f0; color: #666; }}
-    .draft {{ background: #e8e8e8; color: #57606a; }}
-    .ci-pass {{ background: #dafbe1; color: #116329; }}
-    .ci-fail {{ background: #ffebe9; color: #cf222e; }}
-    .ci-pending {{ background: #fff8c5; color: #7a4f01; }}
-    .merge-ok {{ background: #dafbe1; color: #116329; }}
-    .merge-behind {{ background: #fff8c5; color: #7a4f01; }}
-    .merge-conflict {{ background: #ffebe9; color: #cf222e; }}
-    .resolved {{ color: #888; }}
-    .unresolved-human {{ background: #ffebe9; color: #cf222e; }}
-    .unresolved-bot {{ background: #fff8c5; color: #7a4f01; }}
-    .comment-detail {{ font-size: 11px; color: #57606a; margin-left: 4px; }}
-    .comment-detail strong {{ color: #cf222e; font-weight: 600; }}
-    .time-col {{ white-space: nowrap; color: #57606a; font-size: 13px; }}
-    .harness-col {{ white-space: nowrap; }}
-    .harness-logo {{ width: 18px; height: 18px; border-radius: 4px; vertical-align: middle; }}
-    .harness-session {{ font-size: 12px; margin-left: 6px; vertical-align: middle; }}
-    .muted {{ color: #ccc; }}
-    .empty {{ color: #888; font-style: italic; }}
-    .gh-error {{ background: #ffebe9; border: 1px solid rgba(207,34,46,0.4); color: #cf222e;
-                 padding: 12px 16px; border-radius: 8px; margin-bottom: 20px;
-                 font-size: 14px; line-height: 1.5; }}
-    .gh-error code {{ background: #fff0ef; padding: 1px 6px; border-radius: 4px;
-                      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }}
-    /* Tab bar */
-    .tabs {{ display: flex; gap: 0; border-bottom: 2px solid #d0d7de; margin-bottom: 24px; }}
-    .tab-btn {{ background: none; border: none; border-bottom: 3px solid transparent; margin-bottom: -2px;
-                padding: 8px 20px; font-size: 14px; font-weight: 500; color: #57606a;
-                cursor: pointer; transition: color 0.15s, border-color 0.15s; }}
-    .tab-btn:hover {{ color: #0969da; }}
-    .tab-btn.active {{ color: #0969da; border-bottom-color: #0969da; }}
-    .tab-content {{ display: none; }}
-    .tab-content.active {{ display: block; }}
-    .errors-tab {{ margin-left: auto; color: #cf222e; }}
-    .errors-tab:hover, .errors-tab.active {{ color: #cf222e; border-bottom-color: #cf222e; }}
-    .error-repo {{ font-weight: 600; white-space: nowrap; }}
-    .error-msg {{ color: #57606a; font-style: italic; font-size: 13px;
-                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-    .errors-footnote {{ margin: 8px 0 16px; font-size: 13px; color: #888; }}
-    .errors-footnote summary {{ cursor: pointer; }}
-    /* Reload / action buttons */
-    .action-btn {{ background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
-                   padding: 2px 10px; font-size: 13px; cursor: pointer; color: #0969da;
-                   transition: all 0.2s ease; }}
-    .action-btn:hover {{ background: #e1e4e8; }}
-    .action-btn:active {{ transform: scale(0.95); }}
-    .action-btn.loading {{ color: #888; pointer-events: none; }}
-    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-    .action-btn.loading::before {{ content: ''; display: inline-block; width: 10px; height: 10px;
-                                   border: 2px solid #ccc; border-top-color: #0969da; border-radius: 50%;
-                                   animation: spin 0.6s linear infinite; margin-right: 6px; vertical-align: middle; }}
-    .review-toolbar {{ margin-bottom: 20px; display: flex; align-items: center; gap: 12px; }}
-    .review-placeholder {{ padding: 40px 0; text-align: center; color: #888; }}
-    .load-btn {{ background: #0969da; color: #fff; border: none; border-radius: 6px;
-                 padding: 8px 20px; font-size: 14px; font-weight: 500; cursor: pointer;
-                 transition: background 0.15s; }}
-    .load-btn:hover {{ background: #0757ba; }}
-    .load-btn.loading {{ background: #6c9fd8; pointer-events: none; }}
-    /* No position:relative here -- th is sticky, which already positions the arrow. */
-    .sortable th {{ cursor: pointer; user-select: none; padding-right: 20px; }}
-    .sortable th::after {{ content: '\\2195'; position: absolute; right: 4px; opacity: 0.3; font-size: 11px; }}
-    .sortable th.sort-asc::after {{ content: '\\25B2'; opacity: 0.7; }}
-    .sortable th.sort-desc::after {{ content: '\\25BC'; opacity: 0.7; }}
-</style>
-</head>
-<body>
-    <h1>PR Status Dashboard</h1>
-    <div class="subtitle">
-        <span>@{gh_user}</span>
-        <span>&middot;</span>
-        <span id="age">Data from just now</span>
-        <span>&middot;</span>
-        <span>Auto-refreshes every {CONFIG["interval"] // 60} min</span>
-        <span>&middot;</span>
-        <button class="action-btn" id="reload-btn" onclick="doReload()">Reload</button>
-    </div>
-    {banner_html}
-    <div class="tabs">
-        <button class="tab-btn active" onclick="switchTab('my-prs', this)">My PRs</button>
-        <button class="tab-btn" onclick="switchTab('review', this)">Review Queue</button>
-        <button class="tab-btn" onclick="switchTab('merged', this)">Recently Merged</button>
-        {errors_tab_btn}
-    </div>
-    <div id="my-prs" class="tab-content active">
-        {my_prs_html}
-    </div>
-    <div id="review" class="tab-content">
-        <div id="review-placeholder" class="review-placeholder">
-            <p>Review queue is not loaded automatically.</p>
-            <button class="load-btn" id="load-review-btn" onclick="loadReviews()">Load Review Queue</button>
-        </div>
-        <div id="review-content" style="display:none">
-            <div class="review-toolbar">
-                <button class="action-btn" onclick="loadReviews()">Refresh</button>
-                <span id="review-age" style="color:#888;font-size:13px;"></span>
-            </div>
-            <div id="review-body"></div>
-        </div>
-    </div>
-    <div id="merged" class="tab-content">
-        <div id="merged-placeholder" class="review-placeholder">
-            <p>Recently merged PRs are not loaded automatically.</p>
-            <button class="load-btn" id="load-merged-btn" onclick="loadMerged()">Load Recently Merged</button>
-        </div>
-        <div id="merged-content" style="display:none">
-            <div class="review-toolbar">
-                <button class="action-btn" onclick="loadMerged()">Refresh</button>
-                <span id="merged-age" style="color:#888;font-size:13px;"></span>
-            </div>
-            <div id="merged-body"></div>
-        </div>
-    </div>
-    <div id="errors" class="tab-content">
-        {errors_html}
-    </div>
-    <script>
-    (function() {{
-        var fetchedAt = {fetched_epoch};
-        var intervalSec = {CONFIG["interval"]};
-        function update() {{
-            var sec = Math.floor(Date.now()/1000 - fetchedAt);
-            var el = document.getElementById('age');
-            if (sec < 60) el.textContent = 'Data from just now';
-            else if (sec < 120) el.textContent = 'Data from 1 min ago';
-            else el.textContent = 'Data from ' + Math.floor(sec/60) + ' min ago';
-        }}
-        update();
-        setInterval(update, 10000);
-        setTimeout(function autoReload() {{
-            var stale = Math.floor(Date.now()/1000 - fetchedAt);
-            if (stale >= intervalSec) {{
-                window.location.reload();
-            }} else {{
-                setTimeout(autoReload, (intervalSec - stale) * 1000);
-            }}
-        }}, intervalSec * 1000);
-    }})();
-
-    function doReload() {{
-        var btn = document.getElementById('reload-btn');
-        btn.classList.add('loading');
-        btn.textContent = 'Refreshing...';
-        window.location.href = '/refresh';
-    }}
-
-    function switchTab(name, btnEl) {{
-        document.querySelectorAll('.tab-content').forEach(function(el) {{ el.classList.remove('active'); }});
-        document.querySelectorAll('.tab-btn').forEach(function(el) {{ el.classList.remove('active'); }});
-        document.getElementById(name).classList.add('active');
-        btnEl.classList.add('active');
-    }}
-
-    function loadReviews() {{
-        var loadBtn = document.getElementById('load-review-btn');
-        var placeholder = document.getElementById('review-placeholder');
-        var content = document.getElementById('review-content');
-        var body = document.getElementById('review-body');
-        var ageEl = document.getElementById('review-age');
-
-        if (loadBtn) loadBtn.classList.add('loading');
-        if (loadBtn) loadBtn.textContent = 'Loading...';
-        document.querySelectorAll('#review-content .action-btn').forEach(function(b) {{
-            b.classList.add('loading'); b.textContent = 'Refreshing...';
-        }});
-
-        fetch('/review-data')
-            .then(function(r) {{ return r.text(); }})
-            .then(function(html) {{
-                placeholder.style.display = 'none';
-                content.style.display = 'block';
-                body.innerHTML = html;
-                var now = new Date();
-                ageEl.textContent = 'Loaded at ' + now.toLocaleTimeString();
-                document.querySelectorAll('#review-content .action-btn').forEach(function(b) {{
-                    b.classList.remove('loading'); b.textContent = 'Refresh';
-                }});
-                initSortable(body);
-            }})
-            .catch(function() {{
-                body.innerHTML = '<p class="empty">Failed to load review queue.</p>';
-                content.style.display = 'block';
-                placeholder.style.display = 'none';
-                document.querySelectorAll('#review-content .action-btn').forEach(function(b) {{
-                    b.classList.remove('loading'); b.textContent = 'Retry';
-                }});
-            }});
-    }}
-
-    function loadMerged() {{
-        var loadBtn = document.getElementById('load-merged-btn');
-        var placeholder = document.getElementById('merged-placeholder');
-        var content = document.getElementById('merged-content');
-        var body = document.getElementById('merged-body');
-        var ageEl = document.getElementById('merged-age');
-
-        if (loadBtn) loadBtn.classList.add('loading');
-        if (loadBtn) loadBtn.textContent = 'Loading...';
-        document.querySelectorAll('#merged-content .action-btn').forEach(function(b) {{
-            b.classList.add('loading'); b.textContent = 'Refreshing...';
-        }});
-
-        fetch('/merged-data')
-            .then(function(r) {{ return r.text(); }})
-            .then(function(html) {{
-                placeholder.style.display = 'none';
-                content.style.display = 'block';
-                body.innerHTML = html;
-                var now = new Date();
-                ageEl.textContent = 'Loaded at ' + now.toLocaleTimeString();
-                document.querySelectorAll('#merged-content .action-btn').forEach(function(b) {{
-                    b.classList.remove('loading'); b.textContent = 'Refresh';
-                }});
-                initSortable(body);
-            }})
-            .catch(function() {{
-                body.innerHTML = '<p class="empty">Failed to load recently merged PRs.</p>';
-                content.style.display = 'block';
-                placeholder.style.display = 'none';
-                document.querySelectorAll('#merged-content .action-btn').forEach(function(b) {{
-                    b.classList.remove('loading'); b.textContent = 'Retry';
-                }});
-            }});
-    }}
-
-    function initSortable(root) {{
-        (root || document).querySelectorAll('table.sortable').forEach(function(table) {{
-            var headers = table.querySelectorAll('thead th');
-            headers.forEach(function(th, colIdx) {{
-                th.addEventListener('click', function() {{
-                    var tbody = table.querySelector('tbody');
-                    var asc = !th.classList.contains('sort-asc');
-                    headers.forEach(function(h) {{ h.classList.remove('sort-asc', 'sort-desc'); }});
-                    th.classList.add(asc ? 'sort-asc' : 'sort-desc');
-
-                    // Group/subgroup label rows split the body into segments; sort
-                    // within each segment so repos and authors stay put.
-                    var segments = [];
-                    var current = {{ label: null, rows: [] }};
-                    Array.from(tbody.children).forEach(function(tr) {{
-                        if (tr.classList.contains('group-row') || tr.classList.contains('subgroup-row')) {{
-                            segments.push(current);
-                            current = {{ label: tr, rows: [] }};
-                        }} else {{
-                            current.rows.push(tr);
-                        }}
-                    }});
-                    segments.push(current);
-
-                    function cmp(a, b) {{
-                        var cellA = a.cells[colIdx], cellB = b.cells[colIdx];
-                        if (!cellA || !cellB) return 0;
-                        var va = cellA.getAttribute('data-sort') || cellA.textContent.trim();
-                        var vb = cellB.getAttribute('data-sort') || cellB.textContent.trim();
-                        // Strict test: parseFloat('2026-07-30T...') is 2026, which
-                        // would make every same-year timestamp compare equal.
-                        var numeric = /^-?\\d+(\\.\\d+)?$/;
-                        if (numeric.test(va) && numeric.test(vb)) {{
-                            return asc ? va - vb : vb - va;
-                        }}
-                        return asc ? va.localeCompare(vb) : vb.localeCompare(va);
-                    }}
-
-                    segments.forEach(function(seg) {{
-                        seg.rows.sort(cmp);
-                        if (seg.label) tbody.appendChild(seg.label);
-                        seg.rows.forEach(function(row) {{ tbody.appendChild(row); }});
-                    }});
-                }});
-            }});
-        }});
-    }}
-    initSortable();
-    </script>
-</body>
-</html>"""
+FETCHERS = {"mine": fetch_mine, "review": fetch_review, "merged": fetch_merged}
 
 
 # ---------------------------------------------------------------------------
@@ -1137,15 +632,15 @@ def refresh_cache():
     error = gh_health()
     errors = []
     with _cache_lock:
-        my_prs_html, epoch = _cache["my_prs_html"], _cache["fetched_epoch"]
+        items, epoch = _cache["items"], _cache["fetched_epoch"]
     if not error:
         try:
-            my_prs_html, epoch = build_my_prs_body(), int(time.time())
+            items, epoch = fetch_mine(), int(time.time())
         except Exception as e:
-            # Keep the last good table (e.g. while rate-limited) and surface the failure.
-            errors = [("My PRs", str(e))]
+            # Keep the last good data (e.g. while rate-limited) and surface the failure.
+            errors = [{"scope": "mine", "message": str(e)}]
     with _cache_lock:
-        _cache["my_prs_html"] = my_prs_html
+        _cache["items"] = items
         _cache["errors"] = errors
         _cache["fetched_epoch"] = epoch or int(time.time())
         _cache["gh_error"] = error
@@ -1165,69 +660,76 @@ def background_refresher():
             print(f"Cache refresh error: {e}", file=sys.stderr)
 
 
+def api_prs(scopes, force):
+    """Items for the requested scopes. "mine" comes from the background cache
+    unless force=1; the on-demand scopes are always fetched live, in parallel."""
+    if "mine" in scopes and force:
+        refresh_cache()
+    with _cache_lock:
+        payload = {"items": list(_cache["items"]) if "mine" in scopes else [],
+                   "errors": list(_cache["errors"]) if "mine" in scopes else [],
+                   "fetchedAt": _cache["fetched_epoch"], "ghError": _cache["gh_error"]}
+    live = [s for s in scopes if s in FETCHERS and s != "mine"]
+    if live and not payload["ghError"]:
+        def run(scope):
+            try:
+                return scope, FETCHERS[scope](), None
+            except Exception as e:
+                return scope, [], str(e)
+        with ThreadPoolExecutor(max_workers=len(live)) as pool:
+            for scope, items, err in pool.map(run, live):
+                payload["items"] += items
+                if err:
+                    payload["errors"].append({"scope": scope, "message": err})
+    payload.update({"user": CONFIG["gh_user"], "interval": CONFIG["interval"],
+                    "repos": [n for _, n in CONFIG["repos"]], "harnesses": HARNESSES,
+                    "now": int(time.time())})
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         with _last_visit_lock:
             _last_visit["t"] = time.time()
+        url = urlparse(self.path)
+        qs = parse_qs(url.query)
 
-        if self.path == "/refresh":
-            refresh_cache()
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
+        if url.path == "/":
+            return self.serve_file("index.html", "text/html; charset=utf-8", cache=False)
+        if url.path.startswith("/logos/"):
+            name = url.path[len("/logos/"):]
+            if name not in LOGO_FILES:  # only the vendored harness logos are served
+                return self.send_error(404)
+            ctype = "image/svg+xml" if name.endswith(".svg") else "image/png"
+            return self.serve_file(os.path.join("logos", name), ctype, cache=True)
+        if url.path == "/api/prs":
+            scopes = [s for s in (qs.get("scope", ["mine"])[0]).split(",") if s]
+            force = qs.get("refresh", ["0"])[0] == "1"
+            if "mine" in scopes and _cache["fetched_epoch"] == 0 and not force:
+                return self.send_json({"loading": True}, status=503)
+            return self.send_json(api_prs(scopes, force))
+        self.send_error(404)
 
-        if self.path.startswith("/logos/"):
-            self.serve_logo(self.path[len("/logos/"):])
-            return
-
-        if self.path == "/review-data":
-            html = build_review_body()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(html.encode("utf-8"))
-            return
-
-        if self.path == "/merged-data":
-            html = build_merged_body()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(html.encode("utf-8"))
-            return
-
-        with _cache_lock:
-            my_prs_html = _cache["my_prs_html"]
-            errors = _cache["errors"]
-            epoch = _cache["fetched_epoch"]
-            gh_error = _cache["gh_error"]
-        if epoch == 0:
-            page = "<html><body><h1>Loading...</h1><p>First refresh in progress, reload in a few seconds.</p></body></html>"
-        else:
-            page = build_full_page(my_prs_html, epoch, gh_error, errors)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def send_json(self, obj, status=200):
+        blob = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(page.encode("utf-8"))
+        self.wfile.write(blob)
 
-    def serve_logo(self, filename):
-        """Serve a vendored harness logo. Only the names in HARNESS_SPECS are
-        served, so the path can't be used to read anything else."""
-        if filename not in LOGO_FILES:
-            self.send_error(404)
-            return
+    def serve_file(self, rel, ctype, cache):
         try:
-            with open(os.path.join(LOGO_DIR, filename), "rb") as fh:
+            with open(os.path.join(SCRIPT_DIR, rel), "rb") as fh:
                 blob = fh.read()
         except OSError:
             self.send_error(404)
             return
-        ctype = "image/svg+xml" if filename.endswith(".svg") else "image/png"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(blob)))
-        self.send_header("Cache-Control", "max-age=86400")
+        self.send_header("Cache-Control", "max-age=86400" if cache else "no-store")
         self.end_headers()
         self.wfile.write(blob)
 
@@ -1237,7 +739,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PR Status Dashboard - monitor your GitHub PRs locally.",
+        description="PR inbox - monitor your GitHub PRs locally.",
         epilog="Repos can be passed as arguments, configured in config.yml, or auto-discovered via --workspace.",
     )
     parser.add_argument(
@@ -1302,7 +804,7 @@ def main():
     t.start()
 
     server = HTTPServer(("127.0.0.1", CONFIG["port"]), Handler)
-    print(f"PR Status Dashboard running at http://localhost:{CONFIG['port']}")
+    print(f"PR inbox running at http://localhost:{CONFIG['port']}")
     sys.stdout.flush()
     try:
         server.serve_forever()
