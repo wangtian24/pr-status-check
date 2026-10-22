@@ -1,32 +1,43 @@
 # pr-status-check
 
-A local dashboard that shows your GitHub PR status across multiple repos. Zero dependencies beyond Python 3 and the GitHub CLI.
+A local PR inbox: one page that shows which of your GitHub PRs need you, across every repo you work in. Zero dependencies beyond Python 3 and the GitHub CLI.
 
 ## What it shows
 
-For each repo, grouped by section:
+Each PR is sorted into one bucket, derived from its review, CI and merge state:
 
-| Column | Description |
-|--------|-------------|
-| **PR** | PR number (links to GitHub) |
-| **Title** | PR title |
-| **Created** | How long ago the PR was created |
-| **Last Comment** | Time since the last comment/review |
-| **Unresolved Comments** | Count + who left them (human authors highlighted in red) |
-| **Approval** | Review approval state |
-| **CI** | Passing / failed check names / running |
-| **Branch** | Up to date / behind main / conflicts |
+| Bucket | Meaning | Example ask |
+|--------|---------|-------------|
+| **Needs you** | Your PR is blocked on you: conflicts, failing CI, changes requested, or unresolved review comments | `Fix CI: lint`, `Reply to 2 unresolved comments from @alice` |
+| **Ready to merge** | Approved, CI green, nothing unresolved | `Merge it` |
+| **Needs your review** | Open PRs by others from the past 2 days, not yet approved | `Review @bob's PR` |
+| **CI running** | Checks still running, nothing else blocking | |
+| **Waiting on review** | Your PR is fine, waiting on reviewers | |
+| **Draft** | Your drafts from the past 30 days | |
+| **Merged** | Your last 5 merged PRs per repo | |
 
-PRs are categorized as:
-- **Open** — all non-draft open PRs
-- **Drafts** — draft PRs created in the last 30 days
-- **Recently Closed** — PRs closed in the last 7 days
+The pill strip at the top shows the count per bucket; click a pill to filter. By default the board shows the first four buckets, with the rest folded under "other PRs".
 
-## Tabs
+Every PR card carries the harness that built it (Claude Code, Couch, Devin, ...) with a link to its session, the approval / CI / branch state, and when it last changed.
 
-- **My PRs** — your open and draft PRs (loaded automatically, auto-refreshed).
-- **Review Queue** — open PRs from others waiting on your review (loaded on demand).
-- **Recently Merged** — your most recently merged PRs, up to 5 per repo (loaded on demand).
+## Views
+
+- **Blocks** — cards grouped by repo, status or harness.
+- **List** — one dense line per PR, closest to a table.
+- **Catch up** — one PR at a time: its ask, unresolved comment threads, failing checks, reviews and description. `←` `→` browse, `O` open on GitHub, `↓` done, `S` snooze, `X` star.
+
+## Triage
+
+- **✓ Done** hides a PR until it changes (new commit, comment, review or check result).
+- **Snooze** hides it for 4 hours, or until it changes.
+- **Star** keeps it in view; the Starred toggle shows only starred PRs.
+- **NEW** marks PRs that changed since your last visit; "Mark all seen" clears them.
+
+Triage state lives in the browser (localStorage), so it is private to you and survives restarts of the server.
+
+## Scopes
+
+The scope picker (top right) selects which PRs are fetched: **My PRs** (auto-refreshed by the server), **Review queue** and **Recently merged** (fetched live when you refresh). Default: My PRs + Review queue.
 
 ## Prerequisites
 
@@ -114,6 +125,7 @@ list — just run `pr-status restart` to fix it.
 
 - Uses one GitHub GraphQL `search` query per tab (not one call per repo), so a large workspace stays well inside the 5,000-points-per-hour GraphQL budget
 - Auto-detects your GitHub username from `gh auth`
-- Caches results and refreshes in a background thread (default: every 5 min)
+- Classifies PRs on the server (`classify_mine` in `server.py`) and serves them as JSON from `/api/prs?scope=mine,review,merged`; `index.html` renders the inbox
+- Caches your own PRs and refreshes them in a background thread (default: every 5 min); the review queue and merged list are fetched on demand
 - Checks GitHub CLI auth on each refresh and surfaces failures in the UI
-- Serves a static HTML page with a live "X min ago" timer
+- `python3 test_server.py` runs the self-check for the classification rules
