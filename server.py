@@ -282,7 +282,7 @@ def gh_search_prs(query, fields, page_size=50, max_results=1000):
 
 
 def wanted_repos():
-    return {f"{o}/{n}": (o, n) for o, n in CONFIG["repos"]}
+    return {f"{o}/{n}".lower(): (o, n) for o, n in CONFIG["repos"]}
 
 
 def owner_qualifiers():
@@ -508,7 +508,7 @@ def fetch_mine():
     wanted = wanted_repos()
     items = []
     for pr in prs:
-        if pr["repository"]["nameWithOwner"] not in wanted:
+        if pr["repository"]["nameWithOwner"].lower() not in wanted:
             continue
         item = base_item(pr, "mine")
         if item["isDraft"] and datetime.fromisoformat(item["createdAt"].replace("Z", "+00:00")) < thirty_days_ago:
@@ -524,6 +524,8 @@ def fetch_mine():
             if t.get("isResolved") or not first:
                 continue
             login = _login(first.get("author")) or "unknown"
+            if login == CONFIG["gh_user"]:  # the author's own notes don't block the author
+                continue
             item["unresolved"].append({
                 "author": login, "human": not is_bot(login),
                 "body": clip(_HTML_COMMENT_RE.sub("", first.get("body") or ""), COMMENT_LIMIT),
@@ -560,7 +562,7 @@ def fetch_review():
     wanted = wanted_repos()
     items = []
     for pr in gh_search_prs(query, REVIEW_FIELDS):
-        if pr["repository"]["nameWithOwner"] not in wanted:
+        if pr["repository"]["nameWithOwner"].lower() not in wanted:
             continue
         item = base_item(pr, "review")
         review_fields(pr, item)
@@ -592,7 +594,7 @@ def fetch_merged():
     per_repo = {}
     for pr in prs:
         full = pr["repository"]["nameWithOwner"]
-        if full in wanted:
+        if full.lower() in wanted:
             per_repo.setdefault(full, []).append(pr)
     items = []
     for full, repo_prs in per_repo.items():
@@ -630,19 +632,20 @@ def refresh_repos():
 def refresh_cache():
     refresh_repos()
     error = gh_health()
-    errors = []
-    with _cache_lock:
-        items, epoch = _cache["items"], _cache["fetched_epoch"]
+    errors, fetched = [], None
     if not error:
         try:
-            items, epoch = fetch_mine(), int(time.time())
+            fetched = fetch_mine()
         except Exception as e:
             # Keep the last good data (e.g. while rate-limited) and surface the failure.
             errors = [{"scope": "mine", "message": str(e)}]
     with _cache_lock:
-        _cache["items"] = items
+        if fetched is not None:
+            _cache["items"] = fetched
+            _cache["fetched_epoch"] = int(time.time())
+        elif not _cache["fetched_epoch"]:
+            _cache["fetched_epoch"] = int(time.time())
         _cache["errors"] = errors
-        _cache["fetched_epoch"] = epoch or int(time.time())
         _cache["gh_error"] = error
 
 
@@ -663,7 +666,9 @@ def background_refresher():
 def api_prs(scopes, force):
     """Items for the requested scopes. "mine" comes from the background cache
     unless force=1; the on-demand scopes are always fetched live, in parallel."""
-    if "mine" in scopes and force:
+    with _cache_lock:
+        age = time.time() - _cache["fetched_epoch"]
+    if "mine" in scopes and (force or age > CONFIG["interval"]):
         refresh_cache()
     with _cache_lock:
         payload = {"items": list(_cache["items"]) if "mine" in scopes else [],
@@ -705,7 +710,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/prs":
             scopes = [s for s in (qs.get("scope", ["mine"])[0]).split(",") if s]
             force = qs.get("refresh", ["0"])[0] == "1"
-            if "mine" in scopes and _cache["fetched_epoch"] == 0 and not force:
+            with _cache_lock:
+                loading = _cache["fetched_epoch"] == 0
+            if "mine" in scopes and loading and not force:
                 return self.send_json({"loading": True}, status=503)
             return self.send_json(api_prs(scopes, force))
         self.send_error(404)

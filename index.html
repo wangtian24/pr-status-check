@@ -282,7 +282,8 @@ const SCOPES = [["mine","My PRs","open PRs I authored"],["review","Review queue"
 const DEFAULT_SCOPES = ["mine","review"];
 const S = {auto:0, scopes:DEFAULT_SCOPES.slice(), sort:"priority", fRepo:"", fHarness:"", groupBy:"repo", view:"block", starOnly:false,
   items:{}, ui:{}, lastVisit:null, lastRefresh:null, fetchedAt:0, user:"", harnesses:{}, filter:null, busy:false};
-const META_KEYS = ["auto","scopes","sort","fRepo","fHarness","groupBy","view","starOnly","lastVisit","lastRefresh","fetchedAt","user","harnesses"];
+const META_KEYS = ["auto","scopes","sort","fRepo","fHarness","groupBy","view","starOnly","prevVisit","lastVisit","lastRefresh","fetchedAt","user","harnesses"];
+const VISIT_GAP = 10*60e3;
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -301,14 +302,13 @@ function loadState(){
   } catch {}
 }
 let saveT=null;
-function save(){
-  clearTimeout(saveT);
-  saveT = setTimeout(()=>{
-    const meta={}; for (const k of META_KEYS) meta[k]=S[k];
-    try { localStorage.setItem(KEY, JSON.stringify({ui:S.ui, items:S.items, meta})); }
-    catch(e){ showErr("Could not save state: "+e.message); }
-  }, 50);
+function saveNow(){
+  clearTimeout(saveT); saveT=null;
+  const meta={}; for (const k of META_KEYS) meta[k]=S[k];
+  try { localStorage.setItem(KEY, JSON.stringify({ui:S.ui, items:S.items, meta})); }
+  catch(e){ showErr("Could not save state: "+e.message); }
 }
+function save(){ clearTimeout(saveT); saveT = setTimeout(saveNow, 50); }
 function showErr(html){ const d=document.createElement("div"); d.className="err"; d.innerHTML=html; $("errs").appendChild(d); }
 
 // ---------- fetching ----------
@@ -332,8 +332,10 @@ async function refresh(fromAuto){
     } else {
       const next={};
       for (const it of data.items) next[it.id]=it;
-      // Keep items from scopes we didn't ask for this time, so toggling a scope back on is instant.
-      for (const [id,it] of Object.entries(S.items)) if (!S.scopes.includes(it.scope)) next[id]=it;
+      // Keep items from scopes we didn't ask for (so toggling one back on is instant) and from
+      // scopes whose fetch failed (so the banner's "last good data" is true).
+      const failed = new Set((data.errors||[]).map(e=>e.scope));
+      for (const [id,it] of Object.entries(S.items)) if (!S.scopes.includes(it.scope) || failed.has(it.scope)) next[id]=it;
       S.items = next;
       for (const e of data.errors||[]) showErr(`<b>${esc(scopeName(e.scope))}</b> fetch failed: <code>${esc(e.message)}</code>. Showing the last good data.`);
       S.lastRefresh = new Date().toISOString();
@@ -402,15 +404,16 @@ const tAct = it => Date.parse(it.updatedAt||it.createdAt)||0;
 const tCreated = it => Date.parse(it.createdAt)||0;
 const timeLabel = it => S.sort==="created" ? "opened "+ago(it.createdAt) : (it.scope==="merged" && it.mergedAt ? "merged "+ago(it.mergedAt) : ago(it.updatedAt||it.createdAt));
 const byAct = (a,b) => tAct(b)-tAct(a);
+const stOf = it => STATUS[it.status]||STATUS.waiting;
 function cmp(a,b){
   if (S.sort==="created") return tCreated(b)-tCreated(a) || byAct(a,b);
   if (S.sort==="activity") return byAct(a,b);
-  return STATUS[a.status].rank-STATUS[b.status].rank || byAct(a,b);
+  return stOf(a).rank-stOf(b).rank || byAct(a,b);
 }
 const isNew = (id,it) => S.prevVisit && tAct(it) > Date.parse(S.prevVisit) && !opened(id,it);
 
 function itemHTML(id,it,faded){
-  const st=STATUS[it.status]||STATUS.waiting;
+  const st=stOf(it);
   const h = hidden(id,it), nw = isNew(id,it);
   const who = it.scope!=="mine" && it.author ? `<span>@${esc(it.author)}</span>` : "";
   const ref = `<span><b>${esc(it.repo)}</b> #${it.number}</span>`;
@@ -479,10 +482,10 @@ function render(){
   const want = S.filter ? [S.filter] : S.starOnly ? Object.keys(STATUS) : ATTENTION.concat(["running"]);
   const shown = S.filter==="hidden" ? hiddenItems : visible.filter(it=>want.includes(it.status));
   const groups = {};
-  const key = it => S.groupBy==="status" ? STATUS[it.status].label : S.groupBy==="harness" ? hName(hKey(it)) : it.repo;
+  const key = it => S.groupBy==="status" ? stOf(it).label : S.groupBy==="harness" ? hName(hKey(it)) : it.repo;
   shown.forEach(it=>(groups[key(it)] ||= []).push(it));
   const order = Object.entries(groups).map(([t,xs])=>{ xs.sort(cmp); return [t,xs]; })
-    .sort((a,b)=>S.sort==="priority" ? (STATUS[a[1][0].status].rank-STATUS[b[1][0].status].rank || b[1].length-a[1].length) : cmp(a[1][0],b[1][0]));
+    .sort((a,b)=>S.sort==="priority" ? (stOf(a[1][0]).rank-stOf(b[1][0]).rank || b[1].length-a[1].length) : cmp(a[1][0],b[1][0]));
   const attn = visible.filter(it=>it.status==="action"||it.status==="ready").length;
   const rev = visible.filter(it=>it.status==="review").length;
   if (!S.busy){
@@ -497,7 +500,6 @@ function render(){
     CU.deck = shown.slice().sort(cmp); renderCatch(); $("moreBox").style.display="none"; return;
   }
   CU.key="";
-  const gh = t => S.groupBy==="harness" ? t : esc(t);
   $("board").innerHTML = order.length
     ? `<div class="${S.view==="list"?"list":"grid"}">${order.map(([t,xs])=>`<section class="topic"><h2><span>${esc(t)}</span><span>${xs.length}</span></h2>${xs.map(it=>itemHTML(it._id,it,false)).join("")}</section>`).join("")}</div>`
     : `<div class="empty">${Object.keys(S.items).length? (S.starOnly&&!S.filter?"No starred PRs yet — click the ☆ on a PR.":S.filter==="hidden"?"Nothing snoozed or hidden.":S.filter?"Nothing in this bucket.":"Nothing needs you right now. 🎉") : (S.busy?"Fetching your PRs…":"No PRs loaded yet — press Refresh.")}</div>`;
@@ -565,7 +567,7 @@ function renderCatch(force){
   const key=[id,it.fp,n,CU.idx,opened(id,it),starred(id)].join("|");
   if (!force && key===CU.key) return;
   CU.key=key;
-  const st=STATUS[it.status]||STATUS.waiting;
+  const st=stOf(it);
   const nw = isNew(id,it);
   const size = it.changedFiles ? `<span>+${it.additions} −${it.deletions} in ${it.changedFiles} file${it.changedFiles===1?"":"s"}</span>` : "";
   const who = it.scope!=="mine" ? `<span>by @${esc(it.author)}</span>` : "";
@@ -679,18 +681,25 @@ function autoTick(){
   const last = S.lastRefresh ? Date.parse(S.lastRefresh) : 0;
   if (Date.now()-last >= S.auto*60e3) refresh(true);
 }
-setInterval(()=>{ if(!S.busy && !document.hidden) render(); }, 60e3);
+setInterval(()=>{ if(!S.busy && !document.hidden){ render(); stampVisit(); } }, 60e3);
 document.addEventListener("visibilitychange", ()=>{ if(!document.hidden) autoTick(); });
 $("auto").onchange = e=>{ S.auto=+e.target.value; setupAuto(); save(); };
 $("fRepo").onchange = e=>{ S.fRepo=e.target.value; render(); save(); };
 $("fHarness").onchange = e=>{ S.fHarness=e.target.value; render(); save(); };
 function setBtn(label){ const b=$("refresh"); b.classList.toggle("busy",!!label); $("rlabel").textContent = label || "Refresh"; }
-$("markall").onclick = ()=>{ S.prevVisit=S.lastVisit=new Date().toISOString(); render(); save(); };
+$("markall").onclick = ()=>{ S.prevVisit=new Date().toISOString(); stampVisit(); render(); };
 
+// A visit is a stretch of attention: NEW marks what changed since the previous visit. A reload
+// or second tab within VISIT_GAP of the last stamp continues the current visit; a longer gap
+// starts a new one, so the old visit's end becomes the NEW baseline.
+function stampVisit(){ S.lastVisit = new Date().toISOString(); saveNow(); }
+document.addEventListener("visibilitychange", ()=>{ if (document.hidden) stampVisit(); });
+window.addEventListener("pagehide", stampVisit);
 async function boot(){
   loadState();
-  // "NEW" badges compare against the previous visit; this visit is stamped for next time.
-  S.prevVisit = S.lastVisit; S.lastVisit = new Date().toISOString(); save();
+  const last = S.lastVisit ? Date.parse(S.lastVisit) : 0;
+  if (!S.prevVisit || !last || Date.now()-last > VISIT_GAP) S.prevVisit = S.lastVisit;
+  stampVisit();
   render(); setBtn(); setupAuto();
   await refresh(true);
 }

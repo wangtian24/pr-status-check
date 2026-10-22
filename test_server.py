@@ -36,6 +36,23 @@ def test_classification():
     assert waiting["summary"] == "Review required · CI passing · up to date"
 
 
+def test_own_review_threads_do_not_count():
+    server.CONFIG["gh_user"] = "me"
+    pr = {"repository": {"nameWithOwner": "AngelList/Repo"}, "number": 1, "title": "t", "url": "u",
+          "createdAt": "2026-01-01T00:00:00Z", "author": {"login": "me"},
+          "reviewThreads": {"nodes": [
+              {"isResolved": False, "comments": {"nodes": [{"author": {"login": "me"}, "body": "note to self"}]}},
+              {"isResolved": False, "comments": {"nodes": [{"author": {"login": "bob"}, "body": "<!-- x -->fix this"}]}},
+              {"isResolved": True, "comments": {"nodes": [{"author": {"login": "bob"}, "body": "done"}]}},
+          ]}}
+    server.CONFIG["repos"] = [("angellist", "repo")]
+    server.gh_search_prs = lambda *a, **k: [pr]
+    items = server.fetch_mine()
+    assert len(items) == 1 and [t["author"] for t in items[0]["unresolved"]] == ["bob"]
+    assert items[0]["unresolved"][0]["body"] == "fix this"
+    assert items[0]["ask"] == "Reply to 1 unresolved comment from @bob"
+
+
 def test_fingerprint_changes_on_new_activity():
     a = item(); a["updatedAt"] = "2026-01-01T00:00:00Z"
     b = dict(a, updatedAt="2026-01-02T00:00:00Z")
