@@ -205,7 +205,7 @@ body.catch .cu-keys{grid-row:2;grid-column:2}
 }
 /* list view */
 .list .topic{border-radius:10px;margin-top:10px}
-.list .item{grid-template-columns:12px 140px minmax(220px,1.5fr) minmax(180px,1fr) 190px 34px 56px auto;column-gap:12px;align-items:start;padding:7px 14px}
+.list .item{grid-template-columns:12px 140px minmax(220px,1.5fr) minmax(180px,1fr) 190px 42px 56px auto;column-gap:12px;align-items:start;padding:7px 14px}
 .list .item .dot{margin-top:5px;align-self:start}
 .list .item .sum,.list .item .meta{display:none}
 .list .item .ask{margin:0}
@@ -214,7 +214,8 @@ body.catch .cu-keys{grid-row:2;grid-column:2}
 .list .col-ask .todo svg{display:inline;vertical-align:-2px;margin-right:4px}
 .list .col-ask .sum{display:inline}
 .list .col-new,.list .col-repo,.list .col-time{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-top:1px}
-.list .col-repo{display:flex;align-items:center;gap:5px}
+.list .col-repo{display:flex;flex-wrap:wrap;align-items:center;gap:3px 6px}
+.list .col-repo .harn{flex-basis:100%;gap:5px}
 .list .col-repo b{color:var(--ink);font-weight:600}
 .list .col-time{text-align:right}
 .list .acts{flex-direction:row}
@@ -358,7 +359,8 @@ function hiddenLabel(id,h){
 }
 function opened(id,it){ const u=S.ui[id]; return !!(u && u.opened_fp && u.opened_fp===it.fp); }
 function markOpened(id){ const it=S.items[id]; if(!it || opened(id,it)) return; setTimeout(()=>setUi(id,{opened_fp:it.fp,opened_at:new Date().toISOString()}),0); }
-document.addEventListener("auxclick", e=>{ const lt=e.target.closest(".item[data-id] a.t"); if(lt && e.button===1) markOpened(lt.closest(".item").dataset.id); });
+const OPENERS = ".item[data-id] a.t, .item[data-id] a.sess";
+document.addEventListener("auxclick", e=>{ const lt=e.target.closest(OPENERS); if(lt && e.button===1) markOpened(lt.closest(".item").dataset.id); });
 function hidden(id, it){
   const u=S.ui[id]; if(!u) return null;
   if (u.dismissed_fp && u.dismissed_fp===it.fp) return "dismissed";
@@ -375,10 +377,10 @@ function harnessHTML(it, size){
   const h = S.harnesses[it.harness]||{label:it.harness,logo:""}; const lbl=esc(h.label);
   const img = h.logo ? `<img class="hl" src="/logos/${esc(h.logo)}" alt="${lbl}" title="${lbl}">` : "";
   if (!it.harnessSession) return `<span class="harn">${img}${size==="full"?`<span>${lbl}</span>`:""}</span>`;
-  const link = `href="${esc(it.harnessSession)}" target="_blank" rel="noopener" title="Open the ${lbl} session"`;
+  const link = `href="${esc(it.harnessSession)}" target="_blank" rel="noopener" data-cuopen="1" title="Open the ${lbl} session"`;
   return size==="full"
     ? `<span class="harn">${img}<a class="sess" ${link}>${lbl} session ↗</a></span>`
-    : `<a class="harn sess" ${link}>${img}↗</a>`;
+    : `<a class="harn sess" ${link}>${img}${lbl} ↗</a>`;
 }
 function chips(it){
   const out=[];
@@ -423,7 +425,7 @@ function itemHTML(id,it,faded){
   const ref = `<span><b>${esc(it.repo)}</b> #${it.number}</span>`;
   return `<div class="item ${faded?"faded":""} ${opened(id,it)?"opened":""}" data-id="${esc(id)}" data-href="${esc(it.url)}">
     <span class="dot" style="background:${st.color}" title="${st.label}"></span>
-    ${S.view==="list" ? `<div class="col-repo">${harnessHTML(it)}${ref}</div>
+    ${S.view==="list" ? `<div class="col-repo">${ref}${harnessHTML(it)}</div>
       <a class="t" href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.title)}</a>
       <div class="col-ask ask" title="${esc(it.ask||it.summary)}">${it.ask?`<span class="todo">${TODO_ICON}<b>${esc(it.ask)}</b></span>`:`<span class="sum">${esc(it.summary)}</span>`}</div>
       ${chips(it)}
@@ -593,7 +595,7 @@ function renderCatch(force){
       </div>
       <div class="cu-foot">
         <a class="primary" href="${esc(it.url)}" target="_blank" rel="noopener" data-cuopen="1" style="text-decoration:none"><button class="primary" tabindex="-1">Open on GitHub</button></a>
-        ${it.harnessSession?`<a href="${esc(it.harnessSession)}" target="_blank" rel="noopener" style="text-decoration:none"><button tabindex="-1">${esc(harnessLabel(it))} session</button></a>`:""}
+        ${it.harnessSession?`<a href="${esc(it.harnessSession)}" target="_blank" rel="noopener" data-cuopen="1" style="text-decoration:none"><button tabindex="-1">${esc(harnessLabel(it))} session ↗</button></a>`:""}
         <span class="sp"></span>
         <button class="star ${starred(id)?"on":""}" data-cu="star" title="Star (X)">${starred(id)?STAR_ON:STAR_OFF} ${starred(id)?"Starred":"Star"}</button>
         <button data-cu="snooze" title="Hide for 4 hours or until it changes (S)">Snooze</button>
@@ -659,7 +661,7 @@ document.addEventListener("click", e=>{
   if (e.target.closest("#scopeBtn")){ const dd=$("scopeDD"); if(dd.classList.contains("open")) closeScopes(); else { scopeBefore=S.scopes.join(); dd.classList.add("open"); } return; }
   if (!e.target.closest("#scopeDD")) closeScopes();
   const p=e.target.closest(".pill"); if(p){ S.filter = S.filter===p.dataset.f?null:p.dataset.f; render(); return; }
-  const lt=e.target.closest(".item[data-id] a.t"); if(lt) markOpened(lt.closest(".item").dataset.id);
+  const lt=e.target.closest(OPENERS); if(lt) markOpened(lt.closest(".item").dataset.id);
   const row=e.target.closest(".item[data-href]");
   if(row && !e.target.closest("button,a")){ const a=row.querySelector("a.t"); if(a) a.click(); return; }
   const b=e.target.closest("button[data-act]"); if(b){ const id=b.dataset.id, it=S.items[id];
