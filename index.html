@@ -26,15 +26,6 @@ header{display:flex;align-items:flex-start;justify-content:space-between;gap:16p
 .seg.viewseg button{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:6px 18px;min-width:84px;font-size:12px;font-weight:600}
 .seg.viewseg button svg{width:20px;height:20px}
 .seg.viewseg button.on{background:var(--blue);color:#fff}
-.dd{position:relative;display:inline-block}
-.dd-btn{display:inline-flex;align-items:center;gap:6px;padding:4px 24px 4px 9px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%236b7280' fill='none' stroke-width='1.5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center}
-.dd-btn.on{border-color:var(--blue);color:var(--blue);font-weight:600}
-.dd-menu{position:absolute;top:calc(100% + 4px);left:0;z-index:20;background:var(--card);border:1px solid var(--line);border-radius:9px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:6px;min-width:200px;display:none}
-.dd.open .dd-menu{display:block}
-.dd-menu label{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;font-size:12px;user-select:none}
-.dd-menu label:hover{background:var(--soft)}
-.dd-menu label small{color:var(--muted);margin-left:auto}
-.dd-menu input{margin:0;accent-color:var(--blue)}
 .ctl{display:inline-flex;align-items:center;gap:6px}
 h1 .logo{width:22px;height:22px;flex:none}
 h1{display:flex;align-items:center;gap:9px;font-size:20px;letter-spacing:-.02em;margin:0}
@@ -184,8 +175,7 @@ body.catch header .controls{gap:6px}
 body.catch .toolbar{flex-direction:column;margin-top:0;gap:12px}
 body.catch .tb-left{gap:12px}
 body.catch .tb-left .controls{flex-direction:column;align-items:stretch;gap:6px}
-body.catch .tb-left select.flt,body.catch .dd,body.catch .dd-btn,body.catch #starBtn{width:100%;max-width:none}
-body.catch .dd-btn{justify-content:flex-start}
+body.catch .tb-left select.flt,body.catch #starBtn{width:100%;max-width:none}
 body.catch .ctl{justify-content:space-between}
 body.catch .viewseg{margin-left:0;order:-1;width:100%;display:flex}
 body.catch .seg.viewseg button{flex:1;min-width:0;padding:8px 6px}
@@ -232,7 +222,7 @@ details.more summary{cursor:pointer;color:var(--muted);font-size:13px}
       <div class="sub" id="sub">Loading…</div>
     </div>
     <div class="controls">
-      <div class="dd" id="scopeDD"><button class="dd-btn" id="scopeBtn" title="Which PRs to scan"></button><div class="dd-menu" id="scopeMenu"></div></div>
+      <div class="seg" id="tabs"></div>
       <select class="flt" id="auto" title="Refresh automatically while this page is open">
         <option value="0">Auto-refresh: off</option><option value="1">Every 1 min</option><option value="5">Every 5 min</option><option value="10">Every 10 min</option><option value="30">Every 30 min</option>
       </select>
@@ -279,10 +269,11 @@ const STATUS = {
 };
 const ATTENTION = ["action","review","ready"];
 const SCOPES = [["mine","My PRs","open PRs I authored"],["review","Review queue","others' PRs from the past 2 days, not yet approved"],["merged","Recently merged","my last 5 merged PRs per repo"]];
-const DEFAULT_SCOPES = ["mine","review"];
-const S = {auto:0, scopes:DEFAULT_SCOPES.slice(), sort:"priority", fRepo:"", fHarness:"", groupBy:"repo", view:"block", starOnly:false,
+const TABS = [["mine","Mine",["mine"]],["review","To review",["review"]],["merged","Merged",["merged"]],["all","All",["mine","review","merged"]]];
+const tabScopes = t => (TABS.find(x=>x[0]===t)||TABS[0])[2].slice();
+const S = {auto:0, tab:"mine", scopes:["mine"], sort:"priority", fRepo:"", fHarness:"", groupBy:"repo", view:"block", starOnly:false,
   items:{}, ui:{}, lastVisit:null, lastRefresh:null, fetchedAt:0, user:"", harnesses:{}, filter:null, busy:false};
-const META_KEYS = ["auto","scopes","sort","fRepo","fHarness","groupBy","view","starOnly","prevVisit","lastVisit","lastRefresh","fetchedAt","user","harnesses"];
+const META_KEYS = ["auto","tab","sort","fRepo","fHarness","groupBy","view","starOnly","prevVisit","lastVisit","lastRefresh","fetchedAt","user","harnesses"];
 const VISIT_GAP = 10*60e3;
 
 const $ = id => document.getElementById(id);
@@ -298,8 +289,8 @@ function loadState(){
     const j = JSON.parse(localStorage.getItem(KEY) || "{}");
     S.ui = j.ui || {}; S.items = j.items || {};
     for (const k of META_KEYS) if (j.meta && k in j.meta) S[k] = j.meta[k];
-    if (!Array.isArray(S.scopes) || !S.scopes.length) S.scopes = DEFAULT_SCOPES.slice();
   } catch {}
+  S.scopes = tabScopes(S.tab);
 }
 let saveT=null;
 function saveNow(){
@@ -448,17 +439,8 @@ function fillSelect(id,allLabel,values,cur,labelOf){
 const hKey = it => it.harness || "none";
 const hName = k => k==="none" ? "No harness" : (S.harnesses[k]?.label || k);
 function renderScopes(){
-  const on=S.scopes, btn=$("scopeBtn");
-  btn.textContent = on.length===SCOPES.length ? "All PRs" : on.map(scopeName).join(" + ");
-  btn.classList.toggle("on", on.join()!==DEFAULT_SCOPES.join());
-  if ($("scopeDD").classList.contains("open")) return;
-  $("scopeMenu").innerHTML = SCOPES.map(([k,l,d])=>`<label title="${esc(d)}"><input type="checkbox" value="${k}" ${on.includes(k)?"checked":""}>${l}</label>`).join("");
-}
-let scopeBefore=null;
-function closeScopes(){
-  const dd=$("scopeDD"); if(!dd.classList.contains("open")) return;
-  dd.classList.remove("open"); renderScopes();
-  if (scopeBefore!==S.scopes.join()){ save(); render(); refresh(); }
+  const n = k => Object.entries(S.items).filter(([id,it])=>tabScopes(k).includes(it.scope) && !hidden(id,it)).length;
+  $("tabs").innerHTML = TABS.map(([k,l])=>`<button data-tab="${k}" class="${S.tab===k?"on":""}">${l} <span class="n">${n(k)}</span></button>`).join("");
 }
 function render(){
   document.body.classList.toggle("catch", S.view==="catch");
@@ -470,6 +452,10 @@ function render(){
   const nStar = allItems.filter(it=>starred(it._id)).length;
   $("starBtn").innerHTML = (S.starOnly?STAR_ON:STAR_OFF)+` Starred${nStar?` (${nStar})`:""}`; $("starBtn").classList.toggle("on",!!S.starOnly);
   const inWin = S.starOnly ? allItems.filter(it=>starred(it._id)) : allItems.filter(inScope);
+  if (inWin.length){
+    if (S.fRepo && !inWin.some(it=>it.repo===S.fRepo)) S.fRepo="";
+    if (S.fHarness && !inWin.some(it=>hKey(it)===S.fHarness)) S.fHarness="";
+  }
   fillSelect("fRepo","All repos",inWin.map(it=>it.repo),S.fRepo);
   fillSelect("fHarness","All harnesses",inWin.map(hKey),S.fHarness,hName);
   const all = inWin.filter(it=>(!S.fRepo||it.repo===S.fRepo) && (!S.fHarness||hKey(it)===S.fHarness));
@@ -487,7 +473,7 @@ function render(){
   const order = Object.entries(groups).map(([t,xs])=>{ xs.sort(cmp); return [t,xs]; })
     .sort((a,b)=>S.sort==="priority" ? (stOf(a[1][0]).rank-stOf(b[1][0]).rank || b[1].length-a[1].length) : cmp(a[1][0],b[1][0]));
   const attn = visible.filter(it=>it.status==="action"||it.status==="ready").length;
-  const rev = visible.filter(it=>it.status==="review").length;
+  const rev = allItems.filter(it=>it.scope==="review" && !hidden(it._id,it)).length;
   if (!S.busy){
     const lv = S.prevVisit ? `last visit ${ago(S.prevVisit)}` : "first visit";
     const parts=[`${attn} need${attn===1?"s":""} you`, `${rev} to review`];
@@ -645,15 +631,8 @@ document.addEventListener("click", e=>{
 })();
 
 // ---------- events ----------
-document.addEventListener("change", e=>{
-  if (!e.target.closest("#scopeMenu")) return;
-  const vals=[...document.querySelectorAll("#scopeMenu input:checked")].map(i=>i.value);
-  if (!vals.length){ e.target.checked=true; return; }
-  S.scopes = SCOPES.map(x=>x[0]).filter(k=>vals.includes(k)); renderScopes();
-});
 document.addEventListener("click", e=>{
-  if (e.target.closest("#scopeBtn")){ const dd=$("scopeDD"); if(dd.classList.contains("open")) closeScopes(); else { scopeBefore=S.scopes.join(); dd.classList.add("open"); } return; }
-  if (!e.target.closest("#scopeDD")) closeScopes();
+  const tb=e.target.closest("#tabs button"); if(tb){ if(tb.dataset.tab!==S.tab){ S.tab=tb.dataset.tab; S.scopes=tabScopes(S.tab); S.filter=null; save(); render(); refresh(); } return; }
   const p=e.target.closest(".pill"); if(p){ S.filter = S.filter===p.dataset.f?null:p.dataset.f; render(); return; }
   const lt=e.target.closest(".item[data-id] a.t"); if(lt) markOpened(lt.closest(".item").dataset.id);
   const row=e.target.closest(".item[data-href]");
