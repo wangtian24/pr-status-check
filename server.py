@@ -493,7 +493,7 @@ OWN_PR_FIELDS = """
     commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 50) { nodes {
         ... on CheckRun { name status conclusion detailsUrl }
         ... on StatusContext { context state targetUrl } } } } } } }
-    reviewThreads(first: 50) { nodes { isResolved
+    reviewThreads(first: 20) { nodes { isResolved
         comments(first: 1) { nodes { author { login } body url path createdAt } } } }
     latestThread: reviewThreads(last: 1) { nodes { comments(last: 1) { nodes { createdAt } } } }
 """
